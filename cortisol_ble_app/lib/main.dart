@@ -1,12 +1,14 @@
 // lib/main.dart
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 import 'dart:math';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:cortisol_ble_app/ml/stress_engine.dart';
+import 'package:path_provider/path_provider.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -44,6 +46,36 @@ class BleHome extends StatefulWidget {
   State<BleHome> createState() => _BleHomeState();
 }
 
+enum SessionLabel { unlabeled, rest, stressTask, recovery }
+
+extension SessionLabelX on SessionLabel {
+  String get value {
+    switch (this) {
+      case SessionLabel.unlabeled:
+        return "unlabeled";
+      case SessionLabel.rest:
+        return "rest";
+      case SessionLabel.stressTask:
+        return "stress_task";
+      case SessionLabel.recovery:
+        return "recovery";
+    }
+  }
+
+  String get title {
+    switch (this) {
+      case SessionLabel.unlabeled:
+        return "Unlabeled";
+      case SessionLabel.rest:
+        return "Rest";
+      case SessionLabel.stressTask:
+        return "Stress Task";
+      case SessionLabel.recovery:
+        return "Recovery";
+    }
+  }
+}
+
 class _BleHomeState extends State<BleHome> {
   final Guid knownCharUuid = Guid("abcd1234-5678-1234-5678-abcdef123456");
   final Guid? knownServiceUuid = null;
@@ -64,6 +96,12 @@ class _BleHomeState extends State<BleHome> {
   bool _reconnecting = false;
   bool _isConnected = false;
   int _tabIndex = 0;
+  bool _mlModelLoaded = false;
+  bool _resubscribing = false;
+  DateTime? _lastNotifyAt;
+  DateTime? _lastAutoReconnectAt;
+  Timer? _notifyWatchdog;
+  Timer? _autoReconnectTimer;
 
   String _status = "Idle";
   String _parseStatus = "Waiting";
@@ -79,16 +117,81 @@ class _BleHomeState extends State<BleHome> {
   double? _temp;
   int? _ts;
   StressInferenceResult? _stressResult;
+  String? _stressInputIssue;
   final StressEngine _stressEngine = StressEngine();
 
   final List<double> _bpmHistory = [];
   final List<double> _gsrHistory = [];
+  final List<double> _stressHistory = [];
+  final List<HistoryEntry> _history = [];
   ScanResult? _lastConnectedScan;
+  Map<String, dynamic> _modelInfo = const {};
+  Map<String, dynamic> _modelMetrics = const {};
+  SessionLabel _sessionLabel = SessionLabel.unlabeled;
+  File? _historyCsvFile;
+  String? _historyCsvPath;
+  int _loggedRows = 0;
 
   @override
   void initState() {
     super.initState();
     _filterController = TextEditingController(text: _deviceNameFilter);
+    _loadMlModel();
+    _loadModelMetadata();
+    _initHistoryLogging();
+    _notifyWatchdog = Timer.periodic(const Duration(seconds: 3), (_) => _watchNotifyHealth());
+    _autoReconnectTimer = Timer.periodic(const Duration(seconds: 10), (_) async {
+      if (!mounted || !_connected || _connecting || _reconnecting || _resubscribing) return;
+      await _silentReconnect();
+    });
+  }
+
+  Future<void> _initHistoryLogging() async {
+    try {
+      final dir = await getApplicationDocumentsDirectory();
+      final stamp = DateTime.now().toIso8601String().replaceAll(":", "-");
+      final file = File("${dir.path}/stress_history_$stamp.csv");
+      await file.writeAsString(
+        "time_iso,ts,bpm_avg,gsr_avg,temp_avg,stress_prob,cortisol_proxy,stress_level,label,ml_loaded\n",
+        mode: FileMode.write,
+      );
+      if (!mounted) return;
+      setState(() {
+        _historyCsvFile = file;
+        _historyCsvPath = file.path;
+        _loggedRows = 0;
+      });
+    } catch (e) {
+      _setError("History logger init failed: $e");
+    }
+  }
+
+  Future<void> _loadMlModel() async {
+    try {
+      final raw = await rootBundle.loadString('assets/models/model_flutter.json');
+      final jsonMap = json.decode(raw) as Map<String, dynamic>;
+      _stressEngine.loadFlutterModel(jsonMap);
+      if (!mounted) return;
+      setState(() => _mlModelLoaded = true);
+    } catch (e) {
+      _setError('ML model load failed, using fallback engine: $e');
+      if (!mounted) return;
+      setState(() => _mlModelLoaded = false);
+    }
+  }
+
+  Future<void> _loadModelMetadata() async {
+    try {
+      final infoRaw = await rootBundle.loadString('assets/models/model_info.json');
+      final metricsRaw = await rootBundle.loadString('assets/models/metrics.json');
+      if (!mounted) return;
+      setState(() {
+        _modelInfo = json.decode(infoRaw) as Map<String, dynamic>;
+        _modelMetrics = json.decode(metricsRaw) as Map<String, dynamic>;
+      });
+    } catch (_) {
+      // keep UI running even if metadata asset is missing
+    }
   }
 
   @override
@@ -97,9 +200,77 @@ class _BleHomeState extends State<BleHome> {
     _connSub?.cancel();
     _notifySub?.cancel();
     _notifySubAlt?.cancel();
+    _notifyWatchdog?.cancel();
+    _autoReconnectTimer?.cancel();
     _device?.disconnect();
     _filterController.dispose();
     super.dispose();
+  }
+
+  Future<void> _watchNotifyHealth() async {
+    if (!mounted || !_connected || _notifyChar == null || _connecting || _reconnecting || _resubscribing) {
+      return;
+    }
+    final last = _lastNotifyAt;
+    if (last == null) return;
+    final now = DateTime.now();
+    final stalled = now.difference(last).inSeconds >= 8;
+    if (!stalled) return;
+    await _resubscribeNotify();
+
+    // If data is still stale after resubscribe, mimic manual reconnect button.
+    final currentLast = _lastNotifyAt;
+    final stillStale = currentLast == null || now.difference(currentLast).inSeconds >= 8;
+    if (!stillStale) return;
+    final canReconnect = _lastAutoReconnectAt == null || now.difference(_lastAutoReconnectAt!).inSeconds >= 15;
+    if (!canReconnect) return;
+    _lastAutoReconnectAt = now;
+    if (mounted) {
+      setState(() => _parseStatus = "Auto reconnecting");
+    }
+    await _silentReconnect();
+  }
+
+  Future<void> _resubscribeNotify() async {
+    final char = _notifyChar;
+    if (char == null || _resubscribing) return;
+    _resubscribing = true;
+    try {
+      await _notifySub?.cancel();
+      await _notifySubAlt?.cancel();
+      _notifySub = null;
+      _notifySubAlt = null;
+      try {
+        await char.setNotifyValue(false);
+      } catch (_) {}
+      await Future.delayed(const Duration(milliseconds: 150));
+      final ok = await _enableNotifyWithRetry(char);
+      if (!ok) return;
+      _attachNotifyStreams(char);
+      _lastNotifyAt = DateTime.now();
+      if (mounted) {
+        setState(() {
+          _parseStatus = "Resubscribed";
+        });
+      }
+    } finally {
+      _resubscribing = false;
+    }
+  }
+
+  void _attachNotifyStreams(BluetoothCharacteristic target) {
+    _notifySub = target.onValueReceived.listen((bytes) {
+      if (!mounted || bytes.isEmpty) return;
+      _onIncomingBytes(bytes);
+    }, onError: (e) {
+      _setError("Notify stream error: $e");
+    });
+    _notifySubAlt = target.lastValueStream.listen((bytes) {
+      if (!mounted || bytes.isEmpty) return;
+      _onIncomingBytes(bytes);
+    }, onError: (e) {
+      _setError("Notify stream(lastValue) error: $e");
+    });
   }
 
   String _normGuid(Guid g) => _normGuidText(g.str);
@@ -140,6 +311,48 @@ class _BleHomeState extends State<BleHome> {
   Future<void> _showToast(String message) async {
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
+  }
+
+  Future<void> _appendHistoryLog(HistoryEntry entry) async {
+    final f = _historyCsvFile;
+    if (f == null) return;
+    final row = "${[
+      entry.when.toIso8601String(),
+      "${entry.ts ?? ""}",
+      _csvNum(entry.bpmAvg),
+      _csvNum(entry.gsrAvg),
+      _csvNum(entry.tempAvg),
+      entry.stressProb.toStringAsFixed(6),
+      entry.cortisolProxy.toStringAsFixed(3),
+      entry.stressLevel,
+      entry.label,
+      _mlModelLoaded ? "1" : "0",
+    ].join(",")}\n";
+    try {
+      await f.writeAsString(row, mode: FileMode.append);
+      if (mounted) {
+        setState(() => _loggedRows += 1);
+      }
+    } catch (e) {
+      _setError("History log write failed: $e");
+    }
+  }
+
+  String _csvNum(double? v) => v == null ? "" : v.toStringAsFixed(4);
+
+  Future<void> _copyHistoryCsvToClipboard() async {
+    final f = _historyCsvFile;
+    if (f == null) {
+      await _showToast("History file not ready");
+      return;
+    }
+    try {
+      final content = await f.readAsString();
+      await Clipboard.setData(ClipboardData(text: content));
+      await _showToast("History CSV copied to clipboard");
+    } catch (e) {
+      _setError("CSV export failed: $e");
+    }
   }
 
   Future<void> _startScan() async {
@@ -214,6 +427,7 @@ class _BleHomeState extends State<BleHome> {
     } catch (_) {}
 
     _notifyChar = null;
+    _lastNotifyAt = null;
 
     try {
       await d.disconnect();
@@ -242,7 +456,14 @@ class _BleHomeState extends State<BleHome> {
     }
   }
 
-  Future<void> _connectTo(ScanResult r, {bool resetData = true}) async {
+  Future<void> _silentReconnect() async {
+    if (_connecting || _reconnecting || _resubscribing) return;
+    final target = _lastConnectedScan;
+    if (target == null) return;
+    await _connectTo(target, resetData: false, silentReconnect: true);
+  }
+
+  Future<void> _connectTo(ScanResult r, {bool resetData = true, bool silentReconnect = false}) async {
     if (_connecting) return;
 
     await _stopScan();
@@ -250,7 +471,7 @@ class _BleHomeState extends State<BleHome> {
     setState(() {
       _connecting = true;
       _isConnected = false;
-      _status = "Connecting";
+      if (!silentReconnect) _status = "Connecting";
       _lastError = null;
       if (resetData) {
         _raw = "";
@@ -262,6 +483,7 @@ class _BleHomeState extends State<BleHome> {
         _stressResult = null;
         _bpmHistory.clear();
         _gsrHistory.clear();
+        _stressHistory.clear();
         _assembler.reset();
         _stressEngine.reset();
       }
@@ -269,6 +491,7 @@ class _BleHomeState extends State<BleHome> {
 
     final d = r.device;
     _lastConnectedScan = r;
+    _lastNotifyAt = null;
 
     await _notifySub?.cancel();
     await _notifySubAlt?.cancel();
@@ -283,7 +506,9 @@ class _BleHomeState extends State<BleHome> {
     _connSub = d.connectionState.listen((s) {
       if (!mounted) return;
       setState(() {
-        _status = "Connection: ${s.name}";
+        if (!silentReconnect) {
+          _status = "Connection: ${s.name}";
+        }
         _isConnected = s == BluetoothConnectionState.connected;
       });
       if (s == BluetoothConnectionState.disconnected) {
@@ -364,20 +589,8 @@ class _BleHomeState extends State<BleHome> {
 
     await _notifySub?.cancel();
     await _notifySubAlt?.cancel();
-    _notifySub = target.onValueReceived.listen((bytes) {
-      if (!mounted) return;
-      if (bytes.isEmpty) return;
-      _onIncomingBytes(bytes);
-    }, onError: (e) {
-      _setError("Notify stream error: $e");
-    });
-    _notifySubAlt = target.lastValueStream.listen((bytes) {
-      if (!mounted) return;
-      if (bytes.isEmpty) return;
-      _onIncomingBytes(bytes);
-    }, onError: (e) {
-      _setError("Notify stream(lastValue) error: $e");
-    });
+    _attachNotifyStreams(target);
+    _lastNotifyAt = DateTime.now();
 
     // Optional initial read
     try {
@@ -392,7 +605,7 @@ class _BleHomeState extends State<BleHome> {
     setState(() {
       _connecting = false;
       _isConnected = true;
-      _status = "Connected";
+      if (!silentReconnect) _status = "Connected";
       _parseStatus = "Listening";
     });
   }
@@ -425,6 +638,7 @@ class _BleHomeState extends State<BleHome> {
   void _onIncomingBytes(List<int> bytes) {
     final chunk = utf8.decode(bytes, allowMalformed: true);
     if (chunk.isEmpty) return;
+    _lastNotifyAt = DateTime.now();
 
     setState(() {
       _raw += chunk;
@@ -480,6 +694,7 @@ class _BleHomeState extends State<BleHome> {
 
     MetricGroup? bpm;
     MetricGroup? gsr;
+    MetricGroup? tempGroup;
     double? temp;
 
     final bpmObj = obj["BPM"] ?? obj["bpm"];
@@ -498,9 +713,11 @@ class _BleHomeState extends State<BleHome> {
 
     final tempObj = obj["Temp"] ?? obj["TEMP"] ?? obj["temp"] ?? obj["skinTemp"] ?? obj["temperature"];
     if (tempObj is Map<String, dynamic>) {
-      temp = MetricGroup.fromMap(tempObj).avg;
+      tempGroup = MetricGroup.fromMap(tempObj);
+      temp = tempGroup.avg;
     } else if (tempObj is Map) {
-      temp = MetricGroup.fromMap(tempObj.cast<String, dynamic>()).avg;
+      tempGroup = MetricGroup.fromMap(tempObj.cast<String, dynamic>());
+      temp = tempGroup.avg;
     } else if (tempObj is num) {
       temp = tempObj.toDouble();
     } else if (tempObj is String) {
@@ -520,25 +737,69 @@ class _BleHomeState extends State<BleHome> {
       return;
     }
 
-    final bpmAvg = bpm?.avg ?? _bpm?.avg;
-    final gsrAvg = gsr?.avg ?? _gsr?.avg;
-    final tempVal = temp ?? _temp;
+    final bpmNow = bpm ?? _bpm;
+    final gsrNow = gsr ?? _gsr;
+    final tempAvgNow = temp ?? _temp;
     final tsVal = ts ?? _ts;
+    final bpmValid = _isValidSignal(bpmNow?.avg);
+    final gsrValid = _isValidSignal(gsrNow?.avg);
+    final tempValid = _isValidSignal(tempAvgNow);
 
-    final inference = _stressEngine.addSample(
-      ts: tsVal,
-      bpm: bpmAvg,
-      gsr: gsrAvg,
-      temp: tempVal,
-    );
+    String? stressIssue;
+    if (!bpmValid) {
+      stressIssue = "Stress requires valid heart rate";
+    } else if (!gsrValid) {
+      stressIssue = "Stress requires valid GSR";
+    } else if (!tempValid) {
+      stressIssue = "Stress requires valid temperature";
+    }
+
+    StressInferenceResult? inference;
+    if (stressIssue == null) {
+      inference = _stressEngine.addSample(
+        ts: tsVal,
+        bpmAvg: bpmNow?.avg,
+        bpmMin: bpmNow?.min,
+        bpmMax: bpmNow?.max,
+        bpmStd: bpmNow?.std,
+        gsrAvg: gsrNow?.avg,
+        gsrMin: gsrNow?.min,
+        gsrMax: gsrNow?.max,
+        gsrStd: gsrNow?.std,
+        tempAvg: tempAvgNow,
+        tempMin: tempGroup?.min ?? tempAvgNow,
+        tempMax: tempGroup?.max ?? tempAvgNow,
+        tempStd: tempGroup?.std ?? 0.0,
+      );
+    }
+
+    HistoryEntry? createdEntry;
 
     setState(() {
       _ts = ts ?? _ts;
       _bpm = bpm ?? _bpm;
       _gsr = gsr ?? _gsr;
       _temp = temp ?? _temp;
+      _stressInputIssue = stressIssue;
       if (inference != null) {
         _stressResult = inference;
+        _stressHistory.add(inference.stressProbability);
+        if (_stressHistory.length > 60) _stressHistory.removeAt(0);
+        createdEntry = HistoryEntry(
+          when: DateTime.now(),
+          ts: _ts ?? tsVal,
+          bpmAvg: (_bpm ?? bpmNow)?.avg,
+          gsrAvg: (_gsr ?? gsrNow)?.avg,
+          tempAvg: _temp ?? tempAvgNow,
+          stressProb: inference.stressProbability,
+          cortisolProxy: inference.cortisolProxy,
+          stressLevel: inference.levelText,
+          label: _sessionLabel.value,
+        );
+        _history.add(createdEntry!);
+        if (_history.length > 300) _history.removeAt(0);
+      } else if (stressIssue != null) {
+        _stressResult = null;
       }
 
       if (bpm?.avg != null) {
@@ -552,6 +813,10 @@ class _BleHomeState extends State<BleHome> {
 
       _parseStatus = "OK";
     });
+
+    if (createdEntry != null) {
+      unawaited(_appendHistoryLog(createdEntry!));
+    }
   }
 
   List<ScanResult> get _scanResultsSorted {
@@ -569,11 +834,34 @@ class _BleHomeState extends State<BleHome> {
       _temp = null;
       _ts = null;
       _stressResult = null;
+      _stressInputIssue = null;
       _bpmHistory.clear();
       _gsrHistory.clear();
+      _stressHistory.clear();
+      _history.clear();
       _stressEngine.reset();
       _parseStatus = "Cleared";
     });
+    unawaited(_initHistoryLogging());
+  }
+
+  bool _isValidSignal(double? v) {
+    if (v == null) return false;
+    if (!v.isFinite) return false;
+    return v > 0;
+  }
+
+  void _openHistoryPage() {
+    Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => _HistoryPage(
+          entries: _history,
+          csvPath: _historyCsvPath,
+          loggedRows: _loggedRows,
+          onCopyCsv: _copyHistoryCsvToClipboard,
+        ),
+      ),
+    );
   }
 
   Widget _buildConnectionTab(String? connectedName) {
@@ -601,6 +889,7 @@ class _BleHomeState extends State<BleHome> {
             connected: _connected,
             connectedName: connectedName,
             parseStatus: _parseStatus,
+            mlModelLoaded: _mlModelLoaded,
             filterController: _filterController,
             onFilterChanged: (value) {
               setState(() {
@@ -650,6 +939,8 @@ class _BleHomeState extends State<BleHome> {
           gsr: _gsr,
           temp: _temp,
           stressResult: _stressResult,
+          stressInputIssue: _stressInputIssue,
+          mlModelLoaded: _mlModelLoaded,
           calibrationWindows: _stressEngine.baselineCollected,
           calibrationTarget: _stressEngine.baselineTarget,
           windowSamples: _stressEngine.currentWindowSamples,
@@ -657,6 +948,51 @@ class _BleHomeState extends State<BleHome> {
           calibrationReady: _stressEngine.calibrationReady,
           bpmHistory: _bpmHistory,
           gsrHistory: _gsrHistory,
+          stressHistory: _stressHistory,
+        ),
+        const SizedBox(height: 12),
+        _CardSection(
+          title: "History summary",
+          subtitle: "Recent rolling windows from live session.",
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text("Session label", style: TextStyle(color: Colors.white.withValues(alpha: 0.8))),
+              const SizedBox(height: 8),
+              SegmentedButton<SessionLabel>(
+                segments: const [
+                  ButtonSegment(value: SessionLabel.unlabeled, label: Text("Unlabeled")),
+                  ButtonSegment(value: SessionLabel.rest, label: Text("Rest")),
+                  ButtonSegment(value: SessionLabel.stressTask, label: Text("Stress")),
+                  ButtonSegment(value: SessionLabel.recovery, label: Text("Recovery")),
+                ],
+                selected: {_sessionLabel},
+                onSelectionChanged: (set) {
+                  if (set.isEmpty) return;
+                  setState(() => _sessionLabel = set.first);
+                },
+              ),
+              const SizedBox(height: 10),
+              Wrap(
+                spacing: 8,
+                runSpacing: 8,
+                children: [
+                  _MiniPill(text: "Label ${_sessionLabel.title}"),
+                  _MiniPill(text: "CSV rows $_loggedRows"),
+                  _MiniPill(text: "BPM samples ${_bpmHistory.length}"),
+                  _MiniPill(text: "GSR samples ${_gsrHistory.length}"),
+                  _MiniPill(text: "Stress samples ${_stressHistory.length}"),
+                  _MiniPill(text: _stressHistory.isEmpty ? "Stress avg N/A" : "Stress avg ${(100 * (_stressHistory.reduce((a, b) => a + b) / _stressHistory.length)).toStringAsFixed(1)}%"),
+                ],
+              ),
+              const SizedBox(height: 10),
+              FilledButton.icon(
+                onPressed: _openHistoryPage,
+                icon: const Icon(Icons.table_chart),
+                label: const Text("View history"),
+              ),
+            ],
+          ),
         ),
         const SizedBox(height: 24),
       ],
@@ -716,12 +1052,76 @@ class _BleHomeState extends State<BleHome> {
     );
   }
 
+  Widget _buildAboutTab() {
+    String s(dynamic v) => v == null ? "N/A" : v.toString();
+    final accuracy = _modelMetrics["accuracy"];
+    final f1 = _modelMetrics["f1"];
+    final auc = _modelMetrics["roc_auc"];
+    return ListView(
+      padding: const EdgeInsets.all(16),
+      children: [
+        _CardSection(
+          title: "Open source",
+          subtitle: "Transparency and model provenance",
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(s(_modelInfo["open_source_note"])),
+              const SizedBox(height: 10),
+              _MiniPill(text: "App ${s(_modelInfo["app_version"])}"),
+              const SizedBox(height: 8),
+              _MiniPill(text: "Model ${s(_modelInfo["model_version"])}"),
+              const SizedBox(height: 8),
+              _MiniPill(text: "ML ${_mlModelLoaded ? "ON" : "OFF"}"),
+            ],
+          ),
+        ),
+        const SizedBox(height: 12),
+        _CardSection(
+          title: "Dataset",
+          subtitle: "Training dataset metadata",
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text("Name: ${s(_modelInfo["dataset_name"])}"),
+              Text("Source: ${s(_modelInfo["dataset_source"])}"),
+              Text("DOI: ${s(_modelInfo["dataset_doi"])}"),
+              Text("Version: ${s(_modelInfo["dataset_version"])}"),
+              Text("Dataset date: ${s(_modelInfo["dataset_date"])}"),
+              Text("Last update: ${s(_modelInfo["dataset_last_update"])}"),
+              Text("Subjects: ${s(_modelInfo["dataset_subjects"])}"),
+              Text("Instances: ${s(_modelInfo["dataset_instances"])}"),
+            ],
+          ),
+        ),
+        const SizedBox(height: 12),
+        _CardSection(
+          title: "Model performance",
+          subtitle: "Exported training metrics",
+          child: Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: [
+              _MiniPill(text: "Accuracy ${accuracy == null ? "N/A" : (accuracy as num).toStringAsFixed(3)}"),
+              _MiniPill(text: "F1 ${f1 == null ? "N/A" : (f1 as num).toStringAsFixed(3)}"),
+              _MiniPill(text: "AUC ${auc == null ? "N/A" : (auc as num).toStringAsFixed(3)}"),
+              _MiniPill(text: "Rows ${s(_modelMetrics["rows_total"])}"),
+              _MiniPill(text: "Train ${s(_modelMetrics["rows_train"])}"),
+              _MiniPill(text: "Test ${s(_modelMetrics["rows_test"])}"),
+            ],
+          ),
+        ),
+        const SizedBox(height: 24),
+      ],
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final connectedName = _device?.platformName.isNotEmpty == true
         ? _device!.platformName
         : _device?.remoteId.str;
-    final tabTitles = ["Connection", "Dashboard", "Raw debug"];
+    final tabTitles = ["Connection", "Dashboard", "Raw debug", "About"];
 
     return Scaffold(
       appBar: AppBar(
@@ -744,6 +1144,7 @@ class _BleHomeState extends State<BleHome> {
           _buildConnectionTab(connectedName),
           _buildDashboardTab(),
           _buildRawTab(),
+          _buildAboutTab(),
         ],
       ),
       bottomNavigationBar: NavigationBar(
@@ -753,6 +1154,7 @@ class _BleHomeState extends State<BleHome> {
           NavigationDestination(icon: Icon(Icons.bluetooth_searching), label: "Connection"),
           NavigationDestination(icon: Icon(Icons.monitor_heart), label: "Dashboard"),
           NavigationDestination(icon: Icon(Icons.code), label: "Raw"),
+          NavigationDestination(icon: Icon(Icons.info_outline), label: "About"),
         ],
       ),
     );
@@ -894,6 +1296,7 @@ class _TopActions extends StatelessWidget {
   final bool connected;
   final String? connectedName;
   final String parseStatus;
+  final bool mlModelLoaded;
   final TextEditingController filterController;
   final ValueChanged<String> onFilterChanged;
   final VoidCallback onScan;
@@ -907,6 +1310,7 @@ class _TopActions extends StatelessWidget {
     required this.connected,
     required this.connectedName,
     required this.parseStatus,
+    required this.mlModelLoaded,
     required this.filterController,
     required this.onFilterChanged,
     required this.onScan,
@@ -971,19 +1375,31 @@ class _TopActions extends StatelessWidget {
                 color: cs.surfaceContainerHighest.withValues(alpha: 0.35),
                 border: Border.all(color: Colors.white.withValues(alpha: 0.08)),
               ),
-              child: Row(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Icon(connected ? Icons.bluetooth_connected : Icons.bluetooth, size: 18),
-                  const SizedBox(width: 10),
-                  Expanded(
-                    child: Text(
-                      connected ? "Connected to ${connectedName ?? "device"}" : (connecting ? "Connecting..." : "Not connected"),
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                    ),
+                  Row(
+                    children: [
+                      Icon(connected ? Icons.bluetooth_connected : Icons.bluetooth, size: 18),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: Text(
+                          connected ? "Connected to ${connectedName ?? "device"}" : (connecting ? "Connecting..." : "Not connected"),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                    ],
                   ),
-                  const SizedBox(width: 10),
-                  _MiniPill(text: "Parse: $parseStatus"),
+                  const SizedBox(height: 8),
+                  Wrap(
+                    spacing: 8,
+                    runSpacing: 8,
+                    children: [
+                      _MiniPill(text: "Parse: $parseStatus"),
+                      _MiniPill(text: "ML ${mlModelLoaded ? "ON" : "OFF"}"),
+                    ],
+                  ),
                 ],
               ),
             ),
@@ -1000,6 +1416,8 @@ class _MetricsGrid extends StatelessWidget {
   final MetricGroup? gsr;
   final double? temp;
   final StressInferenceResult? stressResult;
+  final String? stressInputIssue;
+  final bool mlModelLoaded;
   final int calibrationWindows;
   final int calibrationTarget;
   final int windowSamples;
@@ -1007,6 +1425,7 @@ class _MetricsGrid extends StatelessWidget {
   final bool calibrationReady;
   final List<double> bpmHistory;
   final List<double> gsrHistory;
+  final List<double> stressHistory;
 
   const _MetricsGrid({
     required this.ts,
@@ -1014,6 +1433,8 @@ class _MetricsGrid extends StatelessWidget {
     required this.gsr,
     required this.temp,
     required this.stressResult,
+    required this.stressInputIssue,
+    required this.mlModelLoaded,
     required this.calibrationWindows,
     required this.calibrationTarget,
     required this.windowSamples,
@@ -1021,6 +1442,7 @@ class _MetricsGrid extends StatelessWidget {
     required this.calibrationReady,
     required this.bpmHistory,
     required this.gsrHistory,
+    required this.stressHistory,
   });
 
   @override
@@ -1086,8 +1508,10 @@ class _MetricsGrid extends StatelessWidget {
                   primaryValue: stressText,
                   primaryUnit: "level",
                   details: [
+                    ("Model", mlModelLoaded ? "trained logistic" : "fallback heuristic"),
                     ("Probability", stressProb),
                     ("Cortisol proxy", proxyText),
+                    ("Input", stressInputIssue ?? "all valid"),
                     ("Calibration", calibrationReady ? "ready" : "$calibrationWindows/$calibrationTarget"),
                     ("Window", "$windowSamples/$windowTarget"),
                   ],
@@ -1098,6 +1522,8 @@ class _MetricsGrid extends StatelessWidget {
             _MiniSparkline(title: "BPM trend", data: bpmHistory),
             const SizedBox(height: 10),
             _MiniSparkline(title: "GSR trend", data: gsrHistory),
+            const SizedBox(height: 10),
+            _MiniSparkline(title: "Stress probability trend", data: stressHistory),
           ],
         ),
       ),
@@ -1413,6 +1839,138 @@ class _MiniPill extends StatelessWidget {
         border: Border.all(color: Colors.white.withValues(alpha: 0.10)),
       ),
       child: Text(text, style: const TextStyle(fontSize: 12)),
+    );
+  }
+}
+
+class HistoryEntry {
+  final DateTime when;
+  final int? ts;
+  final double? bpmAvg;
+  final double? gsrAvg;
+  final double? tempAvg;
+  final double stressProb;
+  final double cortisolProxy;
+  final String stressLevel;
+  final String label;
+
+  const HistoryEntry({
+    required this.when,
+    required this.ts,
+    required this.bpmAvg,
+    required this.gsrAvg,
+    required this.tempAvg,
+    required this.stressProb,
+    required this.cortisolProxy,
+    required this.stressLevel,
+    required this.label,
+  });
+}
+
+class _HistoryTable extends StatelessWidget {
+  final List<HistoryEntry> entries;
+
+  const _HistoryTable({required this.entries});
+
+  @override
+  Widget build(BuildContext context) {
+    if (entries.isEmpty) {
+      return const _EmptyState(text: "No history yet. Start receiving live data.");
+    }
+
+    final rows = entries.reversed.take(40).toList(growable: false);
+    String fmt(double? v) => v == null ? "N/A" : v.toStringAsFixed(2);
+
+    return SingleChildScrollView(
+      scrollDirection: Axis.horizontal,
+      child: DataTable(
+        columns: const [
+          DataColumn(label: Text("Time")),
+          DataColumn(label: Text("ts")),
+          DataColumn(label: Text("BPM")),
+          DataColumn(label: Text("GSR")),
+          DataColumn(label: Text("Temp")),
+          DataColumn(label: Text("Stress %")),
+          DataColumn(label: Text("Proxy")),
+          DataColumn(label: Text("Level")),
+          DataColumn(label: Text("Label")),
+        ],
+        rows: rows
+            .map(
+              (e) => DataRow(cells: [
+                DataCell(Text("${e.when.hour.toString().padLeft(2, '0')}:${e.when.minute.toString().padLeft(2, '0')}:${e.when.second.toString().padLeft(2, '0')}")),
+                DataCell(Text(e.ts?.toString() ?? "N/A")),
+                DataCell(Text(fmt(e.bpmAvg))),
+                DataCell(Text(fmt(e.gsrAvg))),
+                DataCell(Text(fmt(e.tempAvg))),
+                DataCell(Text((e.stressProb * 100).toStringAsFixed(1))),
+                DataCell(Text(e.cortisolProxy.toStringAsFixed(1))),
+                DataCell(Text(e.stressLevel)),
+                DataCell(Text(e.label)),
+              ]),
+            )
+            .toList(growable: false),
+      ),
+    );
+  }
+}
+
+class _HistoryPage extends StatelessWidget {
+  final List<HistoryEntry> entries;
+  final String? csvPath;
+  final int loggedRows;
+  final Future<void> Function() onCopyCsv;
+
+  const _HistoryPage({
+    required this.entries,
+    required this.csvPath,
+    required this.loggedRows,
+    required this.onCopyCsv,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text("Session History"),
+        actions: [
+          IconButton(
+            tooltip: "Copy CSV",
+            onPressed: onCopyCsv,
+            icon: const Icon(Icons.copy),
+          ),
+          const SizedBox(width: 8),
+        ],
+      ),
+      body: ListView(
+        padding: const EdgeInsets.all(16),
+        children: [
+          _CardSection(
+            title: "Logger",
+            subtitle: "Export and file information",
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                _MiniPill(text: "Logged rows $loggedRows"),
+                const SizedBox(height: 8),
+                Text("CSV path: ${csvPath ?? "N/A"}"),
+                const SizedBox(height: 8),
+                FilledButton.icon(
+                  onPressed: onCopyCsv,
+                  icon: const Icon(Icons.file_copy_outlined),
+                  label: const Text("Copy CSV to clipboard"),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 12),
+          _CardSection(
+            title: "History table",
+            subtitle: "Latest rows from this run",
+            child: _HistoryTable(entries: entries),
+          ),
+        ],
+      ),
     );
   }
 }

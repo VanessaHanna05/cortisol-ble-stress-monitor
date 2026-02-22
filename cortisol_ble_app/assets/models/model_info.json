@@ -1,0 +1,18 @@
+{
+  "app_name": "Cortisol BLE Stress Monitor",
+  "app_version": "0.2.0",
+  "model_version": "stress-logreg-v1",
+  "model_type": "Logistic Regression (binary stress classifier)",
+  "model_training_date": "2026-02-22",
+  "dataset_name": "WESAD (Wearable Stress and Affect Detection)",
+  "dataset_source": "UCI Machine Learning Repository",
+  "dataset_doi": "10.24432/C57K5T",
+  "dataset_version": "UCI id=465 listing",
+  "dataset_date": "2018-09-13",
+  "dataset_last_update": "2018-09-13 (UCI listing link date)",
+  "dataset_instances": 63000000,
+  "dataset_subjects": 15,
+  "dataset_features": 12,
+  "open_source_note": "This app and model pipeline are open development artifacts. Current cortisol is a proxy score from stress probability.",
+  "license": "Project-defined"
+}
