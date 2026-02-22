@@ -1,52 +1,33 @@
 # Cortisol BLE Stress Monitor
 
-Flutter Android app that connects to an ESP32 over BLE, receives physiological data, and displays live health metrics with a stress/cortisol-proxy dashboard.
+Flutter Android app for BLE-based physiological monitoring with on-device stress inference and a cortisol proxy trend.
 
-## Overview
-This project reads BLE notifications from an ESP32 peripheral and parses streamed JSON packets containing:
+## What This App Does
+The app connects to an ESP32 peripheral, receives streamed sensor statistics over BLE, parses fragmented JSON packets, and shows:
+- live BPM, GSR, temperature
+- stress probability and stress level
+- cortisol proxy trend (derived from stress probability)
+- history table and CSV export
+
+## Current Approach
+This project uses a two-stage ML strategy:
+1. Baseline model from WESAD (public dataset)
+2. Fine tuning/retraining with local app session data to reduce domain shift
+
+Inference runs fully on device using exported logistic-regression parameters (`model_flutter.json`).
+
+## Important Scientific Note
+`cortisol_proxy` is **not** biochemical cortisol concentration. It is a stress-derived trend score:
+- `cortisol_proxy = stress_probability * 100`
+
+## BLE Input Format
+Expected payloads contain:
 - `ts`
-- `BPM` stats (`avg`, `min`, `max`, `std`)
-- `GSR` stats (`avg`, `min`, `max`, `std`)
-- `Temp` stats (`avg`, `min`, `max`, `std`)
+- `BPM` map: `avg`, `min`, `max`, `std`
+- `GSR` map: `avg`, `min`, `max`, `std`
+- `Temp` map: `avg`, `min`, `max`, `std`
 
-The app includes:
-- BLE scan/connect/disconnect flow
-- Fragmented JSON stream reassembly and parsing
-- Tabbed UI (`Connection`, `Dashboard`, `Raw`)
-- Expandable metric cards for BPM, GSR, Temperature, Stress
-- Live trend lines and raw stream debug view
-
-## Current Status
-The app is working and usable on Android.
-
-What works now:
-- Device scanning and connection over BLE
-- Characteristic selection and notification enablement
-- Fragmented JSON parsing and metric display
-- Stress and cortisol-proxy display in dashboard
-- Raw debug tab for packet inspection
-
-Current known issue:
-- Live dashboard updates are not fully stable in all runs.
-- Sometimes values stop refreshing until reconnect is pressed.
-
-## Important Note About Inference
-The current stress/cortisol logic is **not a trained ML model yet**.
-
-Right now it uses:
-- Simple on-device feature analysis
-- Heuristic stress scoring and smoothing
-- Calibration-like baseline logic
-
-Planned next step:
-- Replace heuristic scoring with a trained model (starting from WESAD-style feature pipeline + lightweight mobile model).
-
-## Tech Stack
-- Flutter (Material 3)
-- `flutter_blue_plus` `2.1.1`
-- Android target (tested on Samsung S9 SM-G960F)
-
-## BLE Data Format (expected)
+Example:
 ```json
 {
   "ts": 317521,
@@ -56,23 +37,83 @@ Planned next step:
 }
 ```
 
-## Run Locally
+## App Features
+- BLE scan/connect/disconnect/reconnect
+- fragmented stream parser for BLE JSON chunks
+- tabbed UI: `Connection`, `Dashboard`, `Raw`, `About`
+- expandable metric cards and trends
+- dedicated history page with table view
+- session labeling (`Rest`, `Stress`, `Recovery`, `Unlabeled`)
+- CSV logging of valid inference rows
+- copy-to-clipboard CSV export
+
+## Stress Inference Rules
+Stress is computed only when all three are valid:
+- valid BPM
+- valid GSR
+- valid temperature
+
+If one is missing/invalid, stress inference is skipped and the reason is shown.
+
+## Model Files Used In App
+Located in:
+`/Users/naderalmasri/Desktop/Project_IoT/cortisol_ble_app/assets/models`
+
+- `model_flutter.json` model/scaler parameters used by Flutter inference
+- `metrics.json` latest training metrics
+- `model_info.json` model/dataset metadata shown in About tab
+
+## Run The App
 ```bash
 cd /Users/naderalmasri/Desktop/Project_IoT/cortisol_ble_app
 flutter pub get
 flutter run -d SM_G960F
 ```
+Then use hot restart (`R`) after model updates.
 
-## Project Structure
-- `lib/main.dart` main app, BLE handling, parser, UI
-- `lib/ml/stress_engine.dart` current heuristic stress engine scaffold
+## Training Workflow
+Training assets are in:
+`/Users/naderalmasri/Desktop/Project_IoT/training`
 
-## Roadmap
-1. Fix continuous live refresh without manual reconnect
-2. Add notification watchdog + auto-resubscribe fallback
-3. Add labeled data logger for training
-4. Train lightweight stress model and deploy on device
-5. Improve personalization and per-user calibration
+### One-command retrain (WESAD + local sessions)
+```bash
+cd /Users/naderalmasri/Desktop/Project_IoT/training
+make retrain-combined
+```
 
-## Repository Name Suggestion
-`cortisol-ble-stress-monitor`
+This command:
+1. merges WESAD features + local session CSVs
+2. trains combined logistic model
+3. exports artifacts to `training/artifacts_combined`
+4. syncs model and metrics into app assets
+
+### Other useful commands
+```bash
+make help
+make prepare-wesad
+make train-wesad
+make train-combined
+```
+
+## Local Session Data
+Local session CSV files are expected in:
+`/Users/naderalmasri/Desktop/Project_IoT/training/local_sessions`
+
+Schema:
+`time_iso,ts,bpm_avg,gsr_avg,temp_avg,stress_prob,cortisol_proxy,stress_level,label,ml_loaded`
+
+## Dataset Reference
+Primary baseline dataset:
+- WESAD (Wearable Stress and Affect Detection)
+- UCI Repository, DOI: `10.24432/C57K5T`
+
+## Known Limitations
+- live BLE refresh stability still requires ongoing tuning depending on device conditions
+- model output quality depends heavily on real local labeled sessions
+- Local data is only for pipeline testing, not final model validation
+
+## Next Steps
+1. collect more real labeled sessions
+2. retrain with higher real-data ratio
+3. calibrate thresholds and confidence display
+4. improve stream stability to remove periodic reconnect fallback

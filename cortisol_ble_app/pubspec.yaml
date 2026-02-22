@@ -36,6 +36,7 @@ dependencies:
   cupertino_icons: ^1.0.8
   flutter_blue_plus: ^2.1.1
   permission_handler: ^12.0.1
+  path_provider: ^2.1.4
 
 dev_dependencies:
   flutter_test:
@@ -59,10 +60,10 @@ flutter:
   # the material Icons class.
   uses-material-design: true
 
-  # To add assets to your application, add an assets section, like this:
-  # assets:
-  #   - images/a_dot_burr.jpeg
-  #   - images/a_dot_ham.jpeg
+  assets:
+    - assets/models/model_flutter.json
+    - assets/models/metrics.json
+    - assets/models/model_info.json
 
   # An image asset can refer to one or more resolution-specific "variants", see
   # https://flutter.dev/to/resolution-aware-images

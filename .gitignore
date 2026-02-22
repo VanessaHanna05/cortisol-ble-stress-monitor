@@ -1,0 +1,35 @@
+# macOS
+.DS_Store
+
+# Python / virtualenv
+.venv/
+venv/
+training/.venv/
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Dataset and generated training data
+/Users/naderalmasri/Desktop/Project_IoT/datasets/
+datasets/
+training/data/
+training/artifacts/
+training/artifacts_combined/
+training/local_sessions/*.csv
+
+# Temporary logs / outputs
+*.log
+*.tmp
+
+# Flutter / Dart
+cortisol_ble_app/.dart_tool/
+cortisol_ble_app/build/
+cortisol_ble_app/.flutter-plugins
+cortisol_ble_app/.flutter-plugins-dependencies
+cortisol_ble_app/.packages
+
+# IDE
+.vscode/
+.idea/
