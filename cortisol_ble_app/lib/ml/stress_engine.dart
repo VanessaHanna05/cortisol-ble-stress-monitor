@@ -37,6 +37,7 @@ class StressEngine {
 
   final Queue<_SensorPoint> _points = Queue<_SensorPoint>();
   final Queue<_CalibWindow> _calibWindows = Queue<_CalibWindow>();
+  int _calibrationValidCount = 0;
 
   int _samplesSinceInference = 0;
   int _syntheticTs = 0;
@@ -67,6 +68,7 @@ class StressEngine {
 
   void resetCalibration() {
     _calibWindows.clear();
+    _calibrationValidCount = 0;
     _baseline = null;
   }
 
@@ -80,7 +82,7 @@ class StressEngine {
       'baseline_hr_std': b.hrStd,
       'baseline_eda_std': b.edaStd,
       'baseline_temp_std': b.tempStd,
-      'windows': _calibWindows.length,
+      'windows': _calibrationValidCount,
       'target': baselineWindows,
       'version': 1,
     };
@@ -105,8 +107,10 @@ class StressEngine {
     );
 
     _calibWindows.clear();
-    final count = ((json['windows'] as num?)?.toInt() ?? baselineWindows).clamp(0, baselineWindows);
-    for (int i = 0; i < count; i++) {
+    final count = ((json['windows'] as num?)?.toInt() ?? baselineWindows).clamp(0, 1000000);
+    _calibrationValidCount = count;
+    final seedCount = min(count, baselineWindows);
+    for (int i = 0; i < seedCount; i++) {
       _calibWindows.add(
         _CalibWindow(hrMean: hrM, edaMean: edaM, tempMean: tM),
       );
@@ -117,7 +121,7 @@ class StressEngine {
   bool get hasTrainedModel => _trainedLogistic != null || _trainedForest != null;
   bool get calibrationReady => hasTrainedModel && _baseline != null;
   bool get hasBaseline => _baseline != null;
-  int get baselineCollected => _calibWindows.length;
+  int get baselineCollected => _calibrationValidCount;
   int get baselineTarget => baselineWindows;
   int get currentWindowSamples => _points.length;
   int get windowTarget => windowSize;
@@ -211,6 +215,7 @@ class StressEngine {
     final temp = canonical['temp_avg'];
     if (!_isValidSignal(hr) || !_isValidSignal(eda) || !_isValidSignal(temp)) return;
 
+    _calibrationValidCount += 1;
     _calibWindows.add(_CalibWindow(hrMean: hr!, edaMean: eda!, tempMean: temp!));
     while (_calibWindows.length > baselineWindows) {
       _calibWindows.removeFirst();
