@@ -36,16 +36,22 @@ class StressEngine {
   final int baselineWindows;
 
   final Queue<_SensorPoint> _points = Queue<_SensorPoint>();
+  final Queue<_CalibWindow> _calibWindows = Queue<_CalibWindow>();
+
   int _samplesSinceInference = 0;
   int _syntheticTs = 0;
 
+  bool _calibrationMode = false;
   double? _smoothedProb;
-  _LogisticModel? _trainedModel;
+
+  _LogisticModel? _trainedLogistic;
+  _RandomForestModel? _trainedForest;
+  _BaselineStats? _baseline;
 
   StressEngine({
-    this.windowSize = 8,
+    this.windowSize = 20,
     this.stepSize = 1,
-    this.baselineWindows = 8,
+    this.baselineWindows = 12,
   });
 
   void reset() {
@@ -55,15 +61,77 @@ class StressEngine {
     _smoothedProb = null;
   }
 
-  bool get hasTrainedModel => _trainedModel != null;
-  bool get calibrationReady => hasTrainedModel;
-  int get baselineCollected => hasTrainedModel ? baselineWindows : 0;
+  void setCalibrationMode(bool enabled) {
+    _calibrationMode = enabled;
+  }
+
+  void resetCalibration() {
+    _calibWindows.clear();
+    _baseline = null;
+  }
+
+  Map<String, dynamic>? exportCalibration() {
+    final b = _baseline;
+    if (b == null) return null;
+    return {
+      'baseline_hr_mean': b.hrMean,
+      'baseline_eda_mean': b.edaMean,
+      'baseline_temp_mean': b.tempMean,
+      'baseline_hr_std': b.hrStd,
+      'baseline_eda_std': b.edaStd,
+      'baseline_temp_std': b.tempStd,
+      'windows': _calibWindows.length,
+      'target': baselineWindows,
+      'version': 1,
+    };
+  }
+
+  bool loadCalibration(Map<String, dynamic> json) {
+    final hrM = (json['baseline_hr_mean'] as num?)?.toDouble();
+    final edaM = (json['baseline_eda_mean'] as num?)?.toDouble();
+    final tM = (json['baseline_temp_mean'] as num?)?.toDouble();
+    final hrS = (json['baseline_hr_std'] as num?)?.toDouble();
+    final edaS = (json['baseline_eda_std'] as num?)?.toDouble();
+    final tS = (json['baseline_temp_std'] as num?)?.toDouble();
+    if (!_isValidSignal(hrM) || !_isValidSignal(edaM) || !_isValidSignal(tM)) return false;
+
+    _baseline = _BaselineStats(
+      hrMean: hrM!,
+      edaMean: edaM!,
+      tempMean: tM!,
+      hrStd: (hrS == null || !hrS.isFinite || hrS <= 0) ? 1.0 : hrS,
+      edaStd: (edaS == null || !edaS.isFinite || edaS <= 0) ? 1.0 : edaS,
+      tempStd: (tS == null || !tS.isFinite || tS <= 0) ? 1.0 : tS,
+    );
+
+    _calibWindows.clear();
+    final count = ((json['windows'] as num?)?.toInt() ?? baselineWindows).clamp(0, baselineWindows);
+    for (int i = 0; i < count; i++) {
+      _calibWindows.add(
+        _CalibWindow(hrMean: hrM, edaMean: edaM, tempMean: tM),
+      );
+    }
+    return true;
+  }
+
+  bool get hasTrainedModel => _trainedLogistic != null || _trainedForest != null;
+  bool get calibrationReady => hasTrainedModel && _baseline != null;
+  bool get hasBaseline => _baseline != null;
+  int get baselineCollected => _calibWindows.length;
   int get baselineTarget => baselineWindows;
   int get currentWindowSamples => _points.length;
   int get windowTarget => windowSize;
 
   void loadFlutterModel(Map<String, dynamic> json) {
-    _trainedModel = _LogisticModel.fromJson(json);
+    final type = (json['type'] ?? '').toString();
+    if (type == 'random_forest_multiclass') {
+      _trainedForest = _RandomForestModel.fromJson(json);
+      _trainedLogistic = null;
+      return;
+    }
+
+    _trainedLogistic = _LogisticModel.fromJson(json);
+    _trainedForest = null;
   }
 
   StressInferenceResult? addSample({
@@ -107,27 +175,26 @@ class StressEngine {
     }
 
     _samplesSinceInference++;
-    if (_points.length < windowSize || _samplesSinceInference < stepSize) {
+    if (_points.length < 12 || _samplesSinceInference < stepSize) {
       return null;
     }
     _samplesSinceInference = 0;
 
-    final features = _extractFeatures(_points.toList(growable: false));
-    final prob = _predictStressProbability(features);
-    final smooth = _smoothedProb == null ? prob : (_smoothedProb! * 0.7 + prob * 0.3);
+    final canonical = _extractCanonicalFeatures(_points.toList(growable: false));
+
+    if (_calibrationMode) {
+      _collectCalibrationWindow(canonical);
+    }
+
+    final pred = _predict(canonical, _points.toList(growable: false));
+    final calibrated = _calibrateProbability(canonical, pred.stressProbability);
+
+    final smooth = _smoothedProb == null ? calibrated : (_smoothedProb! * 0.7 + calibrated * 0.3);
     _smoothedProb = smooth;
 
     final proxy = (smooth * 100.0).clamp(0.0, 100.0);
-    final confidence = ((smooth - 0.5).abs() * 2.0).clamp(0.0, 1.0);
-
-    StressLevel level;
-    if (smooth < 0.40) {
-      level = StressLevel.low;
-    } else if (smooth < 0.70) {
-      level = StressLevel.medium;
-    } else {
-      level = StressLevel.high;
-    }
+    final confidence = _deltaConfidence(canonical, smooth);
+    final level = pred.levelOverride ?? _levelFromProbability(smooth);
 
     return StressInferenceResult(
       stressProbability: smooth,
@@ -138,7 +205,132 @@ class StressEngine {
     );
   }
 
-  Map<String, double> _extractFeatures(List<_SensorPoint> points) {
+  void _collectCalibrationWindow(Map<String, double> canonical) {
+    final hr = canonical['bpm_avg'];
+    final eda = canonical['gsr_avg'];
+    final temp = canonical['temp_avg'];
+    if (!_isValidSignal(hr) || !_isValidSignal(eda) || !_isValidSignal(temp)) return;
+
+    _calibWindows.add(_CalibWindow(hrMean: hr!, edaMean: eda!, tempMean: temp!));
+    while (_calibWindows.length > baselineWindows) {
+      _calibWindows.removeFirst();
+    }
+
+    _baseline = _BaselineStats.fromWindows(_calibWindows.toList(growable: false));
+  }
+
+  double _calibrateProbability(Map<String, double> canonical, double rawProb) {
+    final b = _baseline;
+    if (b == null) return rawProb;
+
+    final hr = canonical['bpm_avg'] ?? b.hrMean;
+    final eda = canonical['gsr_avg'] ?? b.edaMean;
+    final temp = canonical['temp_avg'] ?? b.tempMean;
+
+    final hrZ = (hr - b.hrMean) / max(1e-6, b.hrStd);
+    final edaZ = (eda - b.edaMean) / max(1e-6, b.edaStd);
+    final tempZ = (temp - b.tempMean) / max(1e-6, b.tempStd);
+
+    final abnormal = (0.4 * hrZ.abs() + 0.4 * edaZ.abs() + 0.2 * tempZ.abs()).clamp(0.0, 3.0) / 3.0;
+    final directionSupport = (0.5 * _sigmoid(hrZ) + 0.5 * _sigmoid(edaZ)).clamp(0.0, 1.0);
+
+    var p = rawProb;
+
+    if (p >= 0.60) {
+      if (abnormal < 0.25 && directionSupport < 0.55) {
+        p = (p - 0.10).clamp(0.0, 1.0);
+      } else if (abnormal > 0.55 && directionSupport > 0.60) {
+        p = (p + 0.07).clamp(0.0, 1.0);
+      }
+    } else if (p <= 0.40) {
+      if (abnormal > 0.60 && directionSupport > 0.60) {
+        p = (p + 0.06).clamp(0.0, 1.0);
+      }
+    } else {
+      if (abnormal < 0.20) {
+        p = (p - 0.04).clamp(0.0, 1.0);
+      } else if (abnormal > 0.60 && directionSupport > 0.55) {
+        p = (p + 0.04).clamp(0.0, 1.0);
+      }
+    }
+
+    return p;
+  }
+
+  double _deltaConfidence(Map<String, double> canonical, double smoothedProb) {
+    final b = _baseline;
+    if (b == null) {
+      return ((smoothedProb - 0.5).abs() * 2.0).clamp(0.0, 1.0);
+    }
+
+    final hr = canonical['bpm_avg'] ?? b.hrMean;
+    final eda = canonical['gsr_avg'] ?? b.edaMean;
+    final temp = canonical['temp_avg'] ?? b.tempMean;
+
+    final hrZ = ((hr - b.hrMean) / max(1e-6, b.hrStd)).abs();
+    final edaZ = ((eda - b.edaMean) / max(1e-6, b.edaStd)).abs();
+    final tempZ = ((temp - b.tempMean) / max(1e-6, b.tempStd)).abs();
+
+    double band(double z) {
+      if (z < 0.5) return 0.20;
+      if (z < 1.0) return 0.40;
+      if (z < 1.5) return 0.60;
+      if (z < 2.0) return 0.80;
+      return 1.00;
+    }
+
+    final sensorConfidence = (0.4 * band(hrZ) + 0.4 * band(edaZ) + 0.2 * band(tempZ)).clamp(0.0, 1.0);
+    final modelConfidence = ((smoothedProb - 0.5).abs() * 2.0).clamp(0.0, 1.0);
+    return (0.7 * sensorConfidence + 0.3 * modelConfidence).clamp(0.0, 1.0);
+  }
+
+  double _sigmoid(double x) {
+    final b = x.clamp(-8.0, 8.0);
+    return 1.0 / (1.0 + exp(-b));
+  }
+
+  bool _isValidSignal(double? v) {
+    if (v == null) return false;
+    if (!v.isFinite) return false;
+    return v > 0;
+  }
+
+  _ModelPrediction _predict(Map<String, double> canonicalFeatures, List<_SensorPoint> points) {
+    if (_trainedForest != null) {
+      final nurseFeatures = _extractNurseFeatures(points);
+      return _trainedForest!.predict(nurseFeatures);
+    }
+
+    if (_trainedLogistic != null) {
+      final adapted = _adaptFeatureUnits(canonicalFeatures);
+      final prob = _trainedLogistic!.predictProbability(adapted);
+      return _ModelPrediction(stressProbability: prob);
+    }
+
+    final adapted = _adaptFeatureUnits(canonicalFeatures);
+    const weights = <String, double>{
+      'bpm_avg': 0.15,
+      'bpm_std': 0.10,
+      'gsr_avg': 0.24,
+      'gsr_std': 0.18,
+      'gsr_slope': 0.14,
+      'temp_avg': -0.07,
+      'temp_slope': -0.05,
+    };
+    double logit = -0.15;
+    weights.forEach((k, w) => logit += w * (adapted[k] ?? 0.0));
+    final bounded = logit.clamp(-8.0, 8.0);
+    final prob = 1.0 / (1.0 + exp(-bounded));
+    return _ModelPrediction(stressProbability: prob);
+  }
+
+  StressLevel _levelFromProbability(double p) {
+    if (p < 0.40) return StressLevel.low;
+    if (p < 0.70) return StressLevel.medium;
+    return StressLevel.high;
+  }
+
+  Map<String, double> _extractCanonicalFeatures(List<_SensorPoint> points) {
     final ts = points.map((p) => p.ts).toList(growable: false);
     final bpmAvg = points.map((p) => p.bpmAvg).toList(growable: false);
     final bpmMin = points.map((p) => p.bpmMin).toList(growable: false);
@@ -175,33 +367,67 @@ class StressEngine {
     };
   }
 
-  double _predictStressProbability(Map<String, double> features) {
-    final adapted = _adaptFeatureUnits(features);
+  Map<String, double> _extractNurseFeatures(List<_SensorPoint> points) {
+    final bpmSeries = points.map((p) => _normalizeBpmForNurse(p.bpmAvg)).toList(growable: false);
+    final gsrSeries = points.map((p) => _normalizeGsrForNurse(p.gsrAvg)).toList(growable: false);
+    final tempSeries = points
+        .map((p) => _normalizeTempForNurse(p.tempAvg ?? p.tempMin ?? p.tempMax ?? 0.0))
+        .toList(growable: false);
 
-    if (_trainedModel != null) {
-      return _trainedModel!.predictProbability(adapted);
+    double lagValue(List<double> s, int lag) {
+      final idx = s.length - 1 - lag;
+      if (idx >= 0) return s[idx];
+      return s.isEmpty ? 0.0 : s.first;
     }
 
-    const weights = <String, double>{
-      'bpm_avg': 0.15,
-      'bpm_std': 0.10,
-      'gsr_avg': 0.24,
-      'gsr_std': 0.18,
-      'gsr_slope': 0.14,
-      'temp_avg': -0.07,
-      'temp_slope': -0.05,
-    };
-    double logit = -0.15;
-    weights.forEach((k, w) => logit += w * (adapted[k] ?? 0.0));
-    final bounded = logit.clamp(-8.0, 8.0);
-    return 1.0 / (1.0 + exp(-bounded));
+    final out = <String, double>{};
+
+    for (int i = 0; i < 10; i++) {
+      final lag = 10 - i;
+      out[(30 - i).toString()] = lagValue(bpmSeries, lag);
+      out[(20 - i).toString()] = lagValue(tempSeries, lag);
+      out[(10 - i).toString()] = lagValue(gsrSeries, lag);
+    }
+
+    out['EDAR_Mean'] = _mean(gsrSeries);
+    out['EDAR_Min'] = gsrSeries.isEmpty ? 0.0 : gsrSeries.reduce(min);
+    out['EDAR_Max'] = gsrSeries.isEmpty ? 0.0 : gsrSeries.reduce(max);
+    out['EDAR_Std'] = _std(gsrSeries, out['EDAR_Mean']!);
+
+    out['HRR_Mean'] = _mean(bpmSeries);
+    out['HRR_Min'] = bpmSeries.isEmpty ? 0.0 : bpmSeries.reduce(min);
+    out['HRR_Max'] = bpmSeries.isEmpty ? 0.0 : bpmSeries.reduce(max);
+    out['HRR_Std'] = _std(bpmSeries, out['HRR_Mean']!);
+
+    out['TEMPR_Mean'] = _mean(tempSeries);
+    out['TEMPR_Min'] = tempSeries.isEmpty ? 0.0 : tempSeries.reduce(min);
+    out['TEMPR_Max'] = tempSeries.isEmpty ? 0.0 : tempSeries.reduce(max);
+    out['TEMPR_Std'] = _std(tempSeries, out['TEMPR_Mean']!);
+
+    return out;
+  }
+
+  double _normalizeBpmForNurse(double bpm) {
+    return ((bpm - 40.0) / 140.0).clamp(0.0, 1.0);
+  }
+
+  double _normalizeGsrForNurse(double gsrRaw) {
+    var g = gsrRaw;
+    if (g > 50.0) g = g / 1000.0;
+    final ln = log(g + 1.0);
+    return (ln / log(6.0)).clamp(0.0, 1.0);
+  }
+
+  double _normalizeTempForNurse(double tempRaw) {
+    var t = tempRaw;
+    if (t > 80.0) t = t / 10.0;
+    if (t > 80.0) t = t / 10.0;
+    return ((t - 25.0) / 15.0).clamp(0.0, 1.0);
   }
 
   Map<String, double> _adaptFeatureUnits(Map<String, double> f) {
     final out = Map<String, double>.from(f);
 
-    // App-side GSR can come as large ADC-like values (e.g., 2200+), while WESAD
-    // EDA features are around single-digit values. Scale down when detected.
     if ((out['gsr_avg'] ?? 0.0) > 50.0) {
       out['gsr_avg'] = (out['gsr_avg'] ?? 0.0) / 1000.0;
       out['gsr_min'] = (out['gsr_min'] ?? 0.0) / 1000.0;
@@ -210,7 +436,6 @@ class StressEngine {
       out['gsr_slope'] = (out['gsr_slope'] ?? 0.0) / 1000.0;
     }
 
-    // Temperature can be streamed as deci/centi units by some firmware.
     if ((out['temp_avg'] ?? 0.0) > 80.0) {
       out['temp_avg'] = (out['temp_avg'] ?? 0.0) / 10.0;
       out['temp_min'] = (out['temp_min'] ?? 0.0) / 10.0;
@@ -308,13 +533,94 @@ class _SensorPoint {
   });
 }
 
+class _CalibWindow {
+  final double hrMean;
+  final double edaMean;
+  final double tempMean;
+
+  const _CalibWindow({
+    required this.hrMean,
+    required this.edaMean,
+    required this.tempMean,
+  });
+}
+
+class _BaselineStats {
+  final double hrMean;
+  final double edaMean;
+  final double tempMean;
+  final double hrStd;
+  final double edaStd;
+  final double tempStd;
+
+  const _BaselineStats({
+    required this.hrMean,
+    required this.edaMean,
+    required this.tempMean,
+    required this.hrStd,
+    required this.edaStd,
+    required this.tempStd,
+  });
+
+  factory _BaselineStats.fromWindows(List<_CalibWindow> ws) {
+    if (ws.isEmpty) {
+      return const _BaselineStats(
+        hrMean: 0,
+        edaMean: 0,
+        tempMean: 0,
+        hrStd: 1,
+        edaStd: 1,
+        tempStd: 1,
+      );
+    }
+
+    double mean(List<double> v) => v.reduce((a, b) => a + b) / v.length;
+    double std(List<double> v, double m) {
+      if (v.length < 2) return 1.0;
+      var s = 0.0;
+      for (final x in v) {
+        final d = x - m;
+        s += d * d;
+      }
+      final out = sqrt(s / (v.length - 1));
+      return (out <= 1e-6 || !out.isFinite) ? 1.0 : out;
+    }
+
+    final hrs = ws.map((e) => e.hrMean).toList(growable: false);
+    final edas = ws.map((e) => e.edaMean).toList(growable: false);
+    final temps = ws.map((e) => e.tempMean).toList(growable: false);
+
+    final hrM = mean(hrs);
+    final edaM = mean(edas);
+    final tempM = mean(temps);
+
+    return _BaselineStats(
+      hrMean: hrM,
+      edaMean: edaM,
+      tempMean: tempM,
+      hrStd: std(hrs, hrM),
+      edaStd: std(edas, edaM),
+      tempStd: std(temps, tempM),
+    );
+  }
+}
+
+class _ModelPrediction {
+  final double stressProbability;
+  final StressLevel? levelOverride;
+
+  const _ModelPrediction({
+    required this.stressProbability,
+    this.levelOverride,
+  });
+}
+
 class _LogisticModel {
   final List<String> features;
   final List<double> scalerMean;
   final List<double> scalerScale;
   final List<double> coef;
   final double intercept;
-  final double threshold;
 
   _LogisticModel({
     required this.features,
@@ -322,7 +628,6 @@ class _LogisticModel {
     required this.scalerScale,
     required this.coef,
     required this.intercept,
-    required this.threshold,
   });
 
   factory _LogisticModel.fromJson(Map<String, dynamic> json) {
@@ -332,7 +637,6 @@ class _LogisticModel {
       scalerScale: (json['scaler_scale'] as List).map((e) => (e as num).toDouble()).toList(growable: false),
       coef: (json['coef'] as List).map((e) => (e as num).toDouble()).toList(growable: false),
       intercept: (json['intercept'] as num).toDouble(),
-      threshold: json['threshold'] == null ? 0.5 : (json['threshold'] as num).toDouble(),
     );
   }
 
@@ -344,13 +648,10 @@ class _LogisticModel {
       final scale = (i < scalerScale.length && scalerScale[i].abs() > 1e-12) ? scalerScale[i] : 1.0;
       final mean = i < scalerMean.length ? scalerMean[i] : 0.0;
 
-      // HRV derived from sparse app summaries is not directly comparable to
-      // training-time beat-to-beat HRV. Keep it neutral to avoid saturation.
       if (key == 'hrv_rmssd' || key == 'hrv_sdnn') {
         raw = mean;
       }
 
-      // Prevent out-of-distribution feature spikes from collapsing probability.
       final z = ((raw - mean) / scale).clamp(-3.0, 3.0);
       final w = i < coef.length ? coef[i] : 0.0;
       logit += w * z;
@@ -358,5 +659,126 @@ class _LogisticModel {
 
     final bounded = logit.clamp(-8.0, 8.0);
     return 1.0 / (1.0 + exp(-bounded));
+  }
+}
+
+class _RandomForestModel {
+  final List<int> classes;
+  final List<String> features;
+  final Map<String, double> featureMin;
+  final Map<String, double> featureMax;
+  final List<_TreeModel> trees;
+
+  _RandomForestModel({
+    required this.classes,
+    required this.features,
+    required this.featureMin,
+    required this.featureMax,
+    required this.trees,
+  });
+
+  factory _RandomForestModel.fromJson(Map<String, dynamic> json) {
+    final treesJson = (json['trees'] as List).cast<Map<String, dynamic>>();
+    return _RandomForestModel(
+      classes: (json['classes'] as List).map((e) => (e as num).toInt()).toList(growable: false),
+      features: (json['features'] as List).map((e) => e.toString()).toList(growable: false),
+      featureMin: (json['feature_min'] as Map<String, dynamic>).map((k, v) => MapEntry(k, (v as num).toDouble())),
+      featureMax: (json['feature_max'] as Map<String, dynamic>).map((k, v) => MapEntry(k, (v as num).toDouble())),
+      trees: treesJson.map(_TreeModel.fromJson).toList(growable: false),
+    );
+  }
+
+  _ModelPrediction predict(Map<String, double> inputFeatures) {
+    final x = List<double>.filled(features.length, 0.0);
+    for (int i = 0; i < features.length; i++) {
+      final key = features[i];
+      final raw = inputFeatures[key] ?? 0.0;
+      final mn = featureMin[key] ?? 0.0;
+      final mx = featureMax[key] ?? 1.0;
+      final den = (mx - mn).abs() < 1e-9 ? 1.0 : (mx - mn);
+      x[i] = ((raw - mn) / den).clamp(0.0, 1.0);
+    }
+
+    final probs = List<double>.filled(classes.length, 0.0);
+    for (final t in trees) {
+      final leafCounts = t.leafClassCounts(x);
+      var sum = 0.0;
+      for (final c in leafCounts) {
+        sum += c;
+      }
+      if (sum <= 0) continue;
+      for (int i = 0; i < probs.length && i < leafCounts.length; i++) {
+        probs[i] += leafCounts[i] / sum;
+      }
+    }
+
+    if (trees.isNotEmpty) {
+      for (int i = 0; i < probs.length; i++) {
+        probs[i] = probs[i] / trees.length;
+      }
+    }
+
+    final idx1 = classes.indexOf(1);
+    final idx2 = classes.indexOf(2);
+    final p1 = idx1 >= 0 ? probs[idx1] : 0.0;
+    final p2 = idx2 >= 0 ? probs[idx2] : 0.0;
+    final stressProb = ((p1 + (2.0 * p2)) / 2.0).clamp(0.0, 1.0);
+
+    var best = 0;
+    for (int i = 1; i < probs.length; i++) {
+      if (probs[i] > probs[best]) best = i;
+    }
+    final cls = classes.isNotEmpty ? classes[best] : 0;
+    final level = cls <= 0 ? StressLevel.low : (cls == 1 ? StressLevel.medium : StressLevel.high);
+
+    return _ModelPrediction(
+      stressProbability: stressProb,
+      levelOverride: level,
+    );
+  }
+}
+
+class _TreeModel {
+  final List<int> childrenLeft;
+  final List<int> childrenRight;
+  final List<int> feature;
+  final List<double> threshold;
+  final List<List<double>> value;
+
+  _TreeModel({
+    required this.childrenLeft,
+    required this.childrenRight,
+    required this.feature,
+    required this.threshold,
+    required this.value,
+  });
+
+  factory _TreeModel.fromJson(Map<String, dynamic> json) {
+    return _TreeModel(
+      childrenLeft: (json['children_left'] as List).map((e) => (e as num).toInt()).toList(growable: false),
+      childrenRight: (json['children_right'] as List).map((e) => (e as num).toInt()).toList(growable: false),
+      feature: (json['feature'] as List).map((e) => (e as num).toInt()).toList(growable: false),
+      threshold: (json['threshold'] as List).map((e) => (e as num).toDouble()).toList(growable: false),
+      value: (json['value'] as List)
+          .map((row) => (row as List).map((v) => (v as num).toDouble()).toList(growable: false))
+          .toList(growable: false),
+    );
+  }
+
+  List<double> leafClassCounts(List<double> x) {
+    var node = 0;
+    while (node >= 0 && node < childrenLeft.length) {
+      final left = childrenLeft[node];
+      final right = childrenRight[node];
+      if (left < 0 || right < 0) {
+        return node < value.length ? value[node] : const [1.0, 0.0, 0.0];
+      }
+
+      final fi = feature[node];
+      final thr = threshold[node];
+      final xv = (fi >= 0 && fi < x.length) ? x[fi] : 0.0;
+      node = xv <= thr ? left : right;
+    }
+    return const [1.0, 0.0, 0.0];
   }
 }

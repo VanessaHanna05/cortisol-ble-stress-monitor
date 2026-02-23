@@ -1,66 +1,136 @@
 {
-  "rows_total": 5516,
-  "rows_train": 4043,
-  "rows_test": 1473,
-  "subjects_train": [
-    "S11",
-    "S13",
-    "S14",
-    "S15",
-    "S16",
-    "S17",
-    "S2",
-    "S3",
-    "S5",
-    "S7",
-    "S9"
-  ],
-  "subjects_test": [
-    "S10",
-    "S4",
-    "S6",
-    "S8"
-  ],
-  "accuracy": 0.8547182620502376,
-  "f1": 0.8167808219178082,
-  "precision": 0.754746835443038,
-  "recall": 0.8899253731343284,
-  "roc_auc": 0.9253273387597764,
-  "confusion_matrix": [
-    [
-      782,
-      155
+  "rows_total": 12445,
+  "features_count": 42,
+  "label_counts": {
+    "0": 5410,
+    "1": 2250,
+    "2": 4785
+  },
+  "best_params_random_grid": {
+    "max_depth": 20,
+    "max_features": "sqrt",
+    "min_samples_leaf": 3,
+    "n_estimators": 500
+  },
+  "cv_best_score_f1_weighted": 0.9537265579616954,
+  "model_random_state": 42,
+  "test_size": 0.2,
+  "group_size": 120,
+  "random_split_metrics": {
+    "accuracy": 0.9674568099638409,
+    "f1_macro": 0.9597866091140382,
+    "f1_weighted": 0.967436371762779,
+    "precision_macro": 0.9611274896115397,
+    "recall_macro": 0.9585848542149135,
+    "confusion_matrix": [
+      [
+        1059,
+        11,
+        12
+      ],
+      [
+        6,
+        414,
+        30
+      ],
+      [
+        5,
+        17,
+        935
+      ]
     ],
-    [
-      59,
-      477
-    ]
-  ],
-  "classification_report": {
-    "0": {
-      "precision": 0.929845422116528,
-      "recall": 0.8345784418356457,
-      "f1-score": 0.8796400449943758,
-      "support": 937.0
-    },
-    "1": {
-      "precision": 0.754746835443038,
-      "recall": 0.8899253731343284,
-      "f1-score": 0.8167808219178082,
-      "support": 536.0
-    },
-    "accuracy": 0.8547182620502376,
-    "macro avg": {
-      "precision": 0.842296128779783,
-      "recall": 0.862251907484987,
-      "f1-score": 0.848210433456092,
-      "support": 1473.0
-    },
-    "weighted avg": {
-      "precision": 0.8661299825666361,
-      "recall": 0.8547182620502376,
-      "f1-score": 0.8567666277716736,
-      "support": 1473.0
+    "classification_report": {
+      "0": {
+        "precision": 0.9897196261682243,
+        "recall": 0.9787430683918669,
+        "f1-score": 0.9842007434944238,
+        "support": 1082.0
+      },
+      "1": {
+        "precision": 0.9366515837104072,
+        "recall": 0.92,
+        "f1-score": 0.9282511210762332,
+        "support": 450.0
+      },
+      "2": {
+        "precision": 0.9570112589559877,
+        "recall": 0.9770114942528736,
+        "f1-score": 0.9669079627714581,
+        "support": 957.0
+      },
+      "accuracy": 0.9674568099638409,
+      "macro avg": {
+        "precision": 0.9611274896115397,
+        "recall": 0.9585848542149135,
+        "f1-score": 0.9597866091140382,
+        "support": 2489.0
+      },
+      "weighted avg": {
+        "precision": 0.967549065088221,
+        "recall": 0.9674568099638409,
+        "f1-score": 0.967436371762779,
+        "support": 2489.0
+      }
     }
-  }
+  },
+  "blocked_split_metrics": {
+    "accuracy": 0.6388888888888888,
+    "f1_macro": 0.6113033904946351,
+    "f1_weighted": 0.6352492917063611,
+    "precision_macro": 0.6083553274240745,
+    "recall_macro": 0.6237720318107915,
+    "confusion_matrix": [
+      [
+        715,
+        46,
+        111
+      ],
+      [
+        53,
+        225,
+        185
+      ],
+      [
+        297,
+        218,
+        670
+      ]
+    ],
+    "classification_report": {
+      "0": {
+        "precision": 0.6713615023474179,
+        "recall": 0.819954128440367,
+        "f1-score": 0.738255033557047,
+        "support": 872.0
+      },
+      "1": {
+        "precision": 0.4601226993865031,
+        "recall": 0.48596112311015116,
+        "f1-score": 0.4726890756302521,
+        "support": 463.0
+      },
+      "2": {
+        "precision": 0.6935817805383023,
+        "recall": 0.5654008438818565,
+        "f1-score": 0.6229660622966062,
+        "support": 1185.0
+      },
+      "accuracy": 0.6388888888888888,
+      "macro avg": {
+        "precision": 0.6083553274240745,
+        "recall": 0.6237720318107915,
+        "f1-score": 0.6113033904946351,
+        "support": 2520.0
+      },
+      "weighted avg": {
+        "precision": 0.6429993848415824,
+        "recall": 0.6388888888888888,
+        "f1-score": 0.6352492917063611,
+        "support": 2520.0
+      }
+    }
+  },
+  "selected_model": "blocked_split_model",
+  "selection_mode": "blocked",
+  "note": "Random split is benchmark-like, blocked split is realistic for sequential lag windows."
 }

@@ -61,6 +61,7 @@ flutter:
   uses-material-design: true
 
   assets:
+    - assets/models/nurse_rf_model.json
     - assets/models/model_flutter.json
     - assets/models/metrics.json
     - assets/models/model_info.json

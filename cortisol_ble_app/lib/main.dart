@@ -131,14 +131,23 @@ class _BleHomeState extends State<BleHome> {
   File? _historyCsvFile;
   String? _historyCsvPath;
   int _loggedRows = 0;
+  File? _calibrationFile;
+  String? _lastCalibrationSignature;
+  String _activeUserId = "default";
+  late final TextEditingController _userIdController;
+  bool _guidedCalibrationActive = false;
+  bool _calibrationPromptShown = false;
+  bool _showDeveloperTools = false;
 
   @override
   void initState() {
     super.initState();
     _filterController = TextEditingController(text: _deviceNameFilter);
+    _userIdController = TextEditingController(text: _activeUserId);
     _loadMlModel();
     _loadModelMetadata();
     _initHistoryLogging();
+    _initCalibrationStorage();
     _notifyWatchdog = Timer.periodic(const Duration(seconds: 3), (_) => _watchNotifyHealth());
     _autoReconnectTimer = Timer.periodic(const Duration(seconds: 10), (_) async {
       if (!mounted || !_connected || _connecting || _reconnecting || _resubscribing) return;
@@ -166,8 +175,167 @@ class _BleHomeState extends State<BleHome> {
     }
   }
 
+  Future<void> _initCalibrationStorage() async {
+    try {
+      await _switchCalibrationUser(_activeUserId, showToast: false);
+    } catch (e) {
+      _setError("Calibration load failed: $e");
+    }
+  }
+
+  Future<void> _switchCalibrationUser(String userId, {bool showToast = true}) async {
+    final cleaned = userId.trim().isEmpty ? "default" : userId.trim();
+    final dir = await getApplicationDocumentsDirectory();
+    final file = File("${dir.path}/user_calibration_$cleaned.json");
+    _calibrationFile = file;
+    _activeUserId = cleaned;
+    _userIdController.text = cleaned;
+    _lastCalibrationSignature = null;
+    _stressEngine.resetCalibration();
+    if (await file.exists()) {
+      final raw = await file.readAsString();
+      final map = json.decode(raw) as Map<String, dynamic>;
+      _stressEngine.loadCalibration(map);
+    }
+    if (mounted) {
+      setState(() {});
+    }
+    if (showToast) {
+      await _showToast("Active user: $cleaned");
+    }
+  }
+
+  void _maybePromptCalibration() {
+    if (!mounted || _calibrationPromptShown || !_connected) return;
+    if (_stressEngine.hasBaseline) return;
+    _calibrationPromptShown = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      if (!mounted) return;
+      await showDialog<void>(
+        context: context,
+        barrierDismissible: true,
+        builder: (ctx) {
+          return AlertDialog(
+            title: const Text("Please calibrate"),
+            content: const Text(
+              "For better personal accuracy, sit calmly for 2 to 5 minutes with minimal movement and normal breathing. Keep good sensor contact. Press Calibrate now to start.",
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.of(ctx).pop(),
+                child: const Text("Later"),
+              ),
+              FilledButton(
+                onPressed: () {
+                  Navigator.of(ctx).pop();
+                  unawaited(_startGuidedCalibrationWithUserPrompt());
+                },
+                child: const Text("Calibrate now"),
+              ),
+            ],
+          );
+        },
+      );
+    });
+  }
+
+  void _startGuidedCalibration() {
+    if (!mounted) return;
+    setState(() {
+      _guidedCalibrationActive = true;
+      _sessionLabel = SessionLabel.rest;
+      _tabIndex = 1; // Dashboard
+    });
+    _stressEngine.setCalibrationMode(true);
+  }
+
+  Future<void> _startGuidedCalibrationWithUserPrompt() async {
+    final controller = TextEditingController(text: _activeUserId);
+    final selected = await showDialog<String>(
+      context: context,
+      barrierDismissible: true,
+      builder: (ctx) {
+        return AlertDialog(
+          title: const Text("Calibration user"),
+          content: TextField(
+            controller: controller,
+            decoration: const InputDecoration(
+              labelText: "User ID",
+              hintText: "example user_01",
+              border: OutlineInputBorder(),
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(ctx).pop(),
+              child: const Text("Cancel"),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.of(ctx).pop(controller.text.trim()),
+              child: const Text("Start"),
+            ),
+          ],
+        );
+      },
+    );
+    if (selected == null) return;
+    await _switchCalibrationUser(selected);
+    _startGuidedCalibration();
+  }
+
+  void _stopGuidedCalibration() {
+    _stressEngine.setCalibrationMode(false);
+    if (!mounted) return;
+    setState(() {
+      _guidedCalibrationActive = false;
+    });
+  }
+
+  Future<void> _persistCalibrationIfNeeded() async {
+    final f = _calibrationFile;
+    if (f == null) return;
+    final payload = _stressEngine.exportCalibration();
+    if (payload == null) return;
+    final signature = json.encode(payload);
+    if (_lastCalibrationSignature == signature) return;
+    _lastCalibrationSignature = signature;
+    try {
+      await f.writeAsString(signature, mode: FileMode.write);
+    } catch (e) {
+      _setError("Calibration save failed: $e");
+    }
+  }
+
+  Future<void> _resetCalibration() async {
+    _stressEngine.resetCalibration();
+    _stressEngine.setCalibrationMode(false);
+    _lastCalibrationSignature = null;
+    final f = _calibrationFile;
+    try {
+      if (f != null && await f.exists()) {
+        await f.delete();
+      }
+    } catch (_) {}
+    if (!mounted) return;
+    setState(() {
+      _guidedCalibrationActive = false;
+    });
+    await _showToast("Calibration reset");
+  }
+
   Future<void> _loadMlModel() async {
     try {
+      try {
+        final nurseRaw = await rootBundle.loadString('assets/models/nurse_rf_model.json');
+        final nurseJson = json.decode(nurseRaw) as Map<String, dynamic>;
+        _stressEngine.loadFlutterModel(nurseJson);
+        if (!mounted) return;
+        setState(() => _mlModelLoaded = true);
+        return;
+      } catch (_) {
+        // Fall back to previous logistic asset.
+      }
+
       final raw = await rootBundle.loadString('assets/models/model_flutter.json');
       final jsonMap = json.decode(raw) as Map<String, dynamic>;
       _stressEngine.loadFlutterModel(jsonMap);
@@ -204,6 +372,7 @@ class _BleHomeState extends State<BleHome> {
     _autoReconnectTimer?.cancel();
     _device?.disconnect();
     _filterController.dispose();
+    _userIdController.dispose();
     super.dispose();
   }
 
@@ -608,6 +777,7 @@ class _BleHomeState extends State<BleHome> {
       if (!silentReconnect) _status = "Connected";
       _parseStatus = "Listening";
     });
+    _maybePromptCalibration();
   }
 
   Future<List<BluetoothService>> _discoverServicesWithRetry(BluetoothDevice d) async {
@@ -817,32 +987,18 @@ class _BleHomeState extends State<BleHome> {
     if (createdEntry != null) {
       unawaited(_appendHistoryLog(createdEntry!));
     }
+    unawaited(_persistCalibrationIfNeeded());
+
+    if (_guidedCalibrationActive && _stressEngine.baselineCollected >= _stressEngine.baselineTarget) {
+      _stopGuidedCalibration();
+      unawaited(_showToast("Calibration complete"));
+    }
   }
 
   List<ScanResult> get _scanResultsSorted {
     final list = _scanByDeviceId.values.toList();
     list.sort((a, b) => b.rssi.compareTo(a.rssi));
     return list;
-  }
-
-  void _clearLiveData() {
-    setState(() {
-      _raw = "";
-      _assembler.reset();
-      _bpm = null;
-      _gsr = null;
-      _temp = null;
-      _ts = null;
-      _stressResult = null;
-      _stressInputIssue = null;
-      _bpmHistory.clear();
-      _gsrHistory.clear();
-      _stressHistory.clear();
-      _history.clear();
-      _stressEngine.reset();
-      _parseStatus = "Cleared";
-    });
-    unawaited(_initHistoryLogging());
   }
 
   bool _isValidSignal(double? v) {
@@ -949,103 +1105,7 @@ class _BleHomeState extends State<BleHome> {
           bpmHistory: _bpmHistory,
           gsrHistory: _gsrHistory,
           stressHistory: _stressHistory,
-        ),
-        const SizedBox(height: 12),
-        _CardSection(
-          title: "History summary",
-          subtitle: "Recent rolling windows from live session.",
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text("Session label", style: TextStyle(color: Colors.white.withValues(alpha: 0.8))),
-              const SizedBox(height: 8),
-              SegmentedButton<SessionLabel>(
-                segments: const [
-                  ButtonSegment(value: SessionLabel.unlabeled, label: Text("Unlabeled")),
-                  ButtonSegment(value: SessionLabel.rest, label: Text("Rest")),
-                  ButtonSegment(value: SessionLabel.stressTask, label: Text("Stress")),
-                  ButtonSegment(value: SessionLabel.recovery, label: Text("Recovery")),
-                ],
-                selected: {_sessionLabel},
-                onSelectionChanged: (set) {
-                  if (set.isEmpty) return;
-                  setState(() => _sessionLabel = set.first);
-                },
-              ),
-              const SizedBox(height: 10),
-              Wrap(
-                spacing: 8,
-                runSpacing: 8,
-                children: [
-                  _MiniPill(text: "Label ${_sessionLabel.title}"),
-                  _MiniPill(text: "CSV rows $_loggedRows"),
-                  _MiniPill(text: "BPM samples ${_bpmHistory.length}"),
-                  _MiniPill(text: "GSR samples ${_gsrHistory.length}"),
-                  _MiniPill(text: "Stress samples ${_stressHistory.length}"),
-                  _MiniPill(text: _stressHistory.isEmpty ? "Stress avg N/A" : "Stress avg ${(100 * (_stressHistory.reduce((a, b) => a + b) / _stressHistory.length)).toStringAsFixed(1)}%"),
-                ],
-              ),
-              const SizedBox(height: 10),
-              FilledButton.icon(
-                onPressed: _openHistoryPage,
-                icon: const Icon(Icons.table_chart),
-                label: const Text("View history"),
-              ),
-            ],
-          ),
-        ),
-        const SizedBox(height: 24),
-      ],
-    );
-  }
-
-  Widget _buildRawTab() {
-    return ListView(
-      padding: const EdgeInsets.all(16),
-      children: [
-        Card(
-          child: Padding(
-            padding: const EdgeInsets.all(14),
-            child: Wrap(
-              spacing: 10,
-              runSpacing: 10,
-              children: [
-                FilledButton.icon(
-                  onPressed: () async {
-                    await Clipboard.setData(ClipboardData(text: _raw));
-                    if (!mounted) return;
-                    await _showToast("Copied raw to clipboard");
-                  },
-                  icon: const Icon(Icons.copy),
-                  label: const Text("Copy raw"),
-                ),
-                OutlinedButton.icon(
-                  onPressed: _clearLiveData,
-                  icon: const Icon(Icons.delete_outline),
-                  label: const Text("Clear all data"),
-                ),
-                _MiniPill(text: "Buffer: ${_assembler.pendingBytes}"),
-                _MiniPill(text: "Parse: $_parseStatus"),
-              ],
-            ),
-          ),
-        ),
-        const SizedBox(height: 12),
-        _CardSection(
-          title: "Raw BLE stream",
-          subtitle: "Latest payload text for debugging parser and packet boundaries.",
-          child: Container(
-            padding: const EdgeInsets.all(12),
-            decoration: BoxDecoration(
-              color: Colors.black.withValues(alpha: 0.25),
-              borderRadius: BorderRadius.circular(12),
-              border: Border.all(color: Colors.white.withValues(alpha: 0.08)),
-            ),
-            child: SelectableText(
-              _raw.isEmpty ? "(empty)" : _raw,
-              style: const TextStyle(fontFamily: "monospace", fontSize: 12),
-            ),
-          ),
+          guidedCalibrationActive: _guidedCalibrationActive,
         ),
         const SizedBox(height: 24),
       ],
@@ -1054,9 +1114,18 @@ class _BleHomeState extends State<BleHome> {
 
   Widget _buildAboutTab() {
     String s(dynamic v) => v == null ? "N/A" : v.toString();
-    final accuracy = _modelMetrics["accuracy"];
-    final f1 = _modelMetrics["f1"];
-    final auc = _modelMetrics["roc_auc"];
+    final random = (_modelMetrics["random_split_metrics"] is Map<String, dynamic>)
+        ? (_modelMetrics["random_split_metrics"] as Map<String, dynamic>)
+        : const <String, dynamic>{};
+    final blocked = (_modelMetrics["blocked_split_metrics"] is Map<String, dynamic>)
+        ? (_modelMetrics["blocked_split_metrics"] as Map<String, dynamic>)
+        : const <String, dynamic>{};
+    final legacyAccuracy = _modelMetrics["accuracy"];
+    final legacyF1 = _modelMetrics["f1"];
+    final randomAccuracy = random["accuracy"] ?? legacyAccuracy;
+    final randomF1 = random["f1_macro"] ?? legacyF1;
+    final blockedAccuracy = blocked["accuracy"];
+    final blockedF1 = blocked["f1_macro"];
     return ListView(
       padding: const EdgeInsets.all(16),
       children: [
@@ -1086,11 +1155,64 @@ class _BleHomeState extends State<BleHome> {
               Text("Name: ${s(_modelInfo["dataset_name"])}"),
               Text("Source: ${s(_modelInfo["dataset_source"])}"),
               Text("DOI: ${s(_modelInfo["dataset_doi"])}"),
+              Text("PMID: ${s(_modelInfo["dataset_pmid"])}"),
+              Text("PMCID: ${s(_modelInfo["dataset_pmcid"])}"),
+              Text("Repository: ${s(_modelInfo["dataset_repository"])}"),
+              Text("Repository DOI: ${s(_modelInfo["dataset_repository_doi"])}"),
               Text("Version: ${s(_modelInfo["dataset_version"])}"),
               Text("Dataset date: ${s(_modelInfo["dataset_date"])}"),
               Text("Last update: ${s(_modelInfo["dataset_last_update"])}"),
               Text("Subjects: ${s(_modelInfo["dataset_subjects"])}"),
               Text("Instances: ${s(_modelInfo["dataset_instances"])}"),
+              Text("Collection period: ${s(_modelInfo["dataset_collection_period"])}"),
+              Text("Total hours: ${s(_modelInfo["dataset_total_hours"])}"),
+              Text("Modalities: ${s(_modelInfo["dataset_modalities"])}"),
+            ],
+          ),
+        ),
+        const SizedBox(height: 12),
+        _CardSection(
+          title: "Calibration",
+          subtitle: "Personal baseline for your own physiology",
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                "How to calibrate: sit calmly for 2 to 5 minutes, normal breathing, minimal movement, good sensor contact.",
+              ),
+              const SizedBox(height: 8),
+              Wrap(
+                spacing: 8,
+                runSpacing: 8,
+                children: [
+                  _MiniPill(text: "Status ${_stressEngine.calibrationReady ? "Ready" : "Not ready"}"),
+                  _MiniPill(text: "Windows ${_stressEngine.baselineCollected}/${_stressEngine.baselineTarget}"),
+                  _MiniPill(text: "Mode ${_guidedCalibrationActive ? "Calibrating" : "Idle"}"),
+                  _MiniPill(text: "User $_activeUserId"),
+                ],
+              ),
+              const SizedBox(height: 10),
+              Wrap(
+                spacing: 10,
+                runSpacing: 10,
+                children: [
+                  FilledButton.icon(
+                    onPressed: _guidedCalibrationActive ? null : _startGuidedCalibrationWithUserPrompt,
+                    icon: const Icon(Icons.play_arrow),
+                    label: const Text("Calibrate now"),
+                  ),
+                  OutlinedButton.icon(
+                    onPressed: _guidedCalibrationActive ? _stopGuidedCalibration : null,
+                    icon: const Icon(Icons.stop),
+                    label: const Text("Stop"),
+                  ),
+                  OutlinedButton.icon(
+                    onPressed: _resetCalibration,
+                    icon: const Icon(Icons.tune),
+                    label: const Text("Reset baseline"),
+                  ),
+                ],
+              ),
             ],
           ),
         ),
@@ -1102,12 +1224,120 @@ class _BleHomeState extends State<BleHome> {
             spacing: 8,
             runSpacing: 8,
             children: [
-              _MiniPill(text: "Accuracy ${accuracy == null ? "N/A" : (accuracy as num).toStringAsFixed(3)}"),
-              _MiniPill(text: "F1 ${f1 == null ? "N/A" : (f1 as num).toStringAsFixed(3)}"),
-              _MiniPill(text: "AUC ${auc == null ? "N/A" : (auc as num).toStringAsFixed(3)}"),
+              _MiniPill(text: "Random acc ${randomAccuracy == null ? "N/A" : (randomAccuracy as num).toStringAsFixed(3)}"),
+              _MiniPill(text: "Random F1 ${randomF1 == null ? "N/A" : (randomF1 as num).toStringAsFixed(3)}"),
+              _MiniPill(text: "Blocked acc ${blockedAccuracy == null ? "N/A" : (blockedAccuracy as num).toStringAsFixed(3)}"),
+              _MiniPill(text: "Blocked F1 ${blockedF1 == null ? "N/A" : (blockedF1 as num).toStringAsFixed(3)}"),
               _MiniPill(text: "Rows ${s(_modelMetrics["rows_total"])}"),
-              _MiniPill(text: "Train ${s(_modelMetrics["rows_train"])}"),
-              _MiniPill(text: "Test ${s(_modelMetrics["rows_test"])}"),
+              _MiniPill(text: "CV best F1w ${_modelMetrics["cv_best_score_f1_weighted"] == null ? "N/A" : ((_modelMetrics["cv_best_score_f1_weighted"] as num).toStringAsFixed(3))}"),
+              _MiniPill(text: "Selected ${s(_modelMetrics["selected_model"])}"),
+            ],
+          ),
+        ),
+        const SizedBox(height: 12),
+        _CardSection(
+          title: "Developer",
+          subtitle: "Data collection and labeling for fine tuning",
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              OutlinedButton.icon(
+                onPressed: () => setState(() => _showDeveloperTools = !_showDeveloperTools),
+                icon: const Icon(Icons.developer_mode),
+                label: Text(_showDeveloperTools ? "Hide developer tools" : "I am a developer"),
+              ),
+              if (_showDeveloperTools) ...[
+                const SizedBox(height: 10),
+                TextField(
+                  controller: _userIdController,
+                  decoration: const InputDecoration(
+                    labelText: "Developer user ID",
+                    border: OutlineInputBorder(),
+                  ),
+                ),
+                const SizedBox(height: 8),
+                Wrap(
+                  spacing: 10,
+                  runSpacing: 10,
+                  children: [
+                    FilledButton.icon(
+                      onPressed: () => _switchCalibrationUser(_userIdController.text),
+                      icon: const Icon(Icons.person),
+                      label: const Text("Load user profile"),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 10),
+                Text("Session label", style: TextStyle(color: Colors.white.withValues(alpha: 0.8))),
+                const SizedBox(height: 8),
+                SegmentedButton<SessionLabel>(
+                  segments: const [
+                    ButtonSegment(value: SessionLabel.unlabeled, label: Text("Unlabeled")),
+                    ButtonSegment(value: SessionLabel.rest, label: Text("Rest")),
+                    ButtonSegment(value: SessionLabel.stressTask, label: Text("Stress")),
+                    ButtonSegment(value: SessionLabel.recovery, label: Text("Recovery")),
+                  ],
+                  selected: {_sessionLabel},
+                  onSelectionChanged: (set) {
+                    if (set.isEmpty) return;
+                    setState(() => _sessionLabel = set.first);
+                  },
+                ),
+                const SizedBox(height: 10),
+                Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: [
+                    _MiniPill(text: "Label ${_sessionLabel.title}"),
+                    _MiniPill(text: "CSV rows $_loggedRows"),
+                    _MiniPill(text: "Path ${_historyCsvPath ?? "N/A"}"),
+                    _MiniPill(text: "Raw bytes ${_raw.length}"),
+                  ],
+                ),
+                const SizedBox(height: 10),
+                Wrap(
+                  spacing: 10,
+                  runSpacing: 10,
+                  children: [
+                    FilledButton.icon(
+                      onPressed: _openHistoryPage,
+                      icon: const Icon(Icons.table_chart),
+                      label: const Text("View history"),
+                    ),
+                    OutlinedButton.icon(
+                      onPressed: _copyHistoryCsvToClipboard,
+                      icon: const Icon(Icons.copy),
+                      label: const Text("Copy CSV"),
+                    ),
+                    OutlinedButton.icon(
+                      onPressed: () async {
+                        await Clipboard.setData(ClipboardData(text: _raw));
+                        if (!mounted) return;
+                        await _showToast("Copied raw to clipboard");
+                      },
+                      icon: const Icon(Icons.code),
+                      label: const Text("Copy raw"),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 10),
+                _CardSection(
+                  title: "Raw BLE stream",
+                  subtitle: "Developer debug view",
+                  child: Container(
+                    padding: const EdgeInsets.all(12),
+                    decoration: BoxDecoration(
+                      color: Colors.black.withValues(alpha: 0.25),
+                      borderRadius: BorderRadius.circular(12),
+                      border: Border.all(color: Colors.white.withValues(alpha: 0.08)),
+                    ),
+                    child: SelectableText(
+                      _raw.isEmpty ? "(empty)" : _raw,
+                      style: const TextStyle(fontFamily: "monospace", fontSize: 12),
+                    ),
+                  ),
+                ),
+              ],
             ],
           ),
         ),
@@ -1121,7 +1351,7 @@ class _BleHomeState extends State<BleHome> {
     final connectedName = _device?.platformName.isNotEmpty == true
         ? _device!.platformName
         : _device?.remoteId.str;
-    final tabTitles = ["Connection", "Dashboard", "Raw debug", "About"];
+    final tabTitles = ["Connection", "Dashboard", "About"];
 
     return Scaffold(
       appBar: AppBar(
@@ -1143,7 +1373,6 @@ class _BleHomeState extends State<BleHome> {
         children: [
           _buildConnectionTab(connectedName),
           _buildDashboardTab(),
-          _buildRawTab(),
           _buildAboutTab(),
         ],
       ),
@@ -1153,7 +1382,6 @@ class _BleHomeState extends State<BleHome> {
         destinations: const [
           NavigationDestination(icon: Icon(Icons.bluetooth_searching), label: "Connection"),
           NavigationDestination(icon: Icon(Icons.monitor_heart), label: "Dashboard"),
-          NavigationDestination(icon: Icon(Icons.code), label: "Raw"),
           NavigationDestination(icon: Icon(Icons.info_outline), label: "About"),
         ],
       ),
@@ -1426,6 +1654,7 @@ class _MetricsGrid extends StatelessWidget {
   final List<double> bpmHistory;
   final List<double> gsrHistory;
   final List<double> stressHistory;
+  final bool guidedCalibrationActive;
 
   const _MetricsGrid({
     required this.ts,
@@ -1443,12 +1672,18 @@ class _MetricsGrid extends StatelessWidget {
     required this.bpmHistory,
     required this.gsrHistory,
     required this.stressHistory,
+    required this.guidedCalibrationActive,
   });
 
   @override
   Widget build(BuildContext context) {
     final stressText = stressResult?.levelText ?? "N/A";
-    final stressProb = stressResult == null ? "N/A" : "${(stressResult!.stressProbability * 100).toStringAsFixed(0)}%";
+    final confidencePct = stressResult == null ? "N/A" : "${(stressResult!.confidence * 100).toStringAsFixed(0)}%";
+    final confidenceLevel = stressResult == null
+        ? "N/A"
+        : (stressResult!.confidence >= 0.75
+            ? "High"
+            : (stressResult!.confidence >= 0.45 ? "Medium" : "Low"));
     final proxyText = stressResult == null ? "N/A" : stressResult!.cortisolProxy.toStringAsFixed(1);
 
     return Card(
@@ -1508,10 +1743,12 @@ class _MetricsGrid extends StatelessWidget {
                   primaryValue: stressText,
                   primaryUnit: "level",
                   details: [
-                    ("Model", mlModelLoaded ? "trained logistic" : "fallback heuristic"),
-                    ("Probability", stressProb),
+                    ("Model", mlModelLoaded ? "trained model" : "fallback heuristic"),
+                    ("Confidence", confidencePct),
+                    ("Confidence level", confidenceLevel),
                     ("Cortisol proxy", proxyText),
                     ("Input", stressInputIssue ?? "all valid"),
+                    ("Guided calibrate", guidedCalibrationActive ? "on" : "off"),
                     ("Calibration", calibrationReady ? "ready" : "$calibrationWindows/$calibrationTarget"),
                     ("Window", "$windowSamples/$windowTarget"),
                   ],
@@ -1523,7 +1760,7 @@ class _MetricsGrid extends StatelessWidget {
             const SizedBox(height: 10),
             _MiniSparkline(title: "GSR trend", data: gsrHistory),
             const SizedBox(height: 10),
-            _MiniSparkline(title: "Stress probability trend", data: stressHistory),
+            _MiniSparkline(title: "Stress score trend", data: stressHistory),
           ],
         ),
       ),

@@ -17,6 +17,8 @@ datasets/
 training/data/
 training/artifacts/
 training/artifacts_combined/
+training/artifacts_hybrid/
+training/artifacts_nurse_rf/
 training/local_sessions/*.csv
 
 # Temporary logs / outputs
