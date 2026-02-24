@@ -142,6 +142,17 @@ class _BleHomeState extends State<BleHome> {
   DateTime? _guidedCalibrationStartedAt;
   Timer? _calibrationTicker;
   static const Duration _minCalibrationDuration = Duration(minutes: 2);
+  bool _stressMeasureActive = false;
+  DateTime? _stressMeasureStartedAt;
+  Timer? _stressMeasureTicker;
+  final List<double> _measureScores = [];
+  final List<double> _measureConfidences = [];
+  int _measureValidSamples = 0;
+  int _measureInvalidSamples = 0;
+  String? _measureLiveIssue;
+  _MeasureSummary? _lastMeasureSummary;
+  static const Duration _measureDuration = Duration(seconds: 60);
+  static const int _measureMinValidSamples = 8;
 
   @override
   void initState() {
@@ -389,6 +400,7 @@ class _BleHomeState extends State<BleHome> {
     _notifyWatchdog?.cancel();
     _autoReconnectTimer?.cancel();
     _calibrationTicker?.cancel();
+    _stressMeasureTicker?.cancel();
     _device?.disconnect();
     _filterController.dispose();
     _userIdController.dispose();
@@ -411,6 +423,129 @@ class _BleHomeState extends State<BleHome> {
       _isValidSignal((_bpm ?? const MetricGroup()).avg) &&
       _isValidSignal((_gsr ?? const MetricGroup()).avg) &&
       _isValidSignal(_temp);
+  Duration get _stressMeasureElapsed {
+    final started = _stressMeasureStartedAt;
+    if (!_stressMeasureActive || started == null) return Duration.zero;
+    return DateTime.now().difference(started);
+  }
+
+  Duration get _stressMeasureRemaining {
+    final left = _measureDuration - _stressMeasureElapsed;
+    return left.isNegative ? Duration.zero : left;
+  }
+
+  double get _stressMeasureProgress {
+    if (_measureDuration.inMilliseconds == 0) return 0;
+    return (_stressMeasureElapsed.inMilliseconds / _measureDuration.inMilliseconds).clamp(0.0, 1.0);
+  }
+
+  String? _plausibilityIssue({double? bpmAvg, double? gsrAvg, double? tempAvg}) {
+    if (!_isValidSignal(bpmAvg)) return "Heart rate not detected";
+    if (!_isValidSignal(gsrAvg)) return "GSR not detected";
+    if (!_isValidSignal(tempAvg)) return "Temperature not detected";
+    if (bpmAvg! < 45 || bpmAvg > 190) {
+      return "Heart rate out of range. Adjust finger sensor contact.";
+    }
+    if (tempAvg! < 20 || tempAvg > 45) {
+      return "Temperature out of range. Check skin contact.";
+    }
+    return null;
+  }
+
+  void _startStressMeasurement() {
+    if (!_connected) {
+      unawaited(_showToast("Connect device before measuring stress"));
+      return;
+    }
+    if (_stressMeasureActive) return;
+    setState(() {
+      _stressMeasureActive = true;
+      _stressMeasureStartedAt = DateTime.now();
+      _measureScores.clear();
+      _measureConfidences.clear();
+      _measureValidSamples = 0;
+      _measureInvalidSamples = 0;
+      _measureLiveIssue = null;
+    });
+    _stressMeasureTicker?.cancel();
+    _stressMeasureTicker = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (!mounted || !_stressMeasureActive) return;
+      if (_stressMeasureRemaining == Duration.zero) {
+        _finalizeStressMeasurement();
+        return;
+      }
+      setState(() {});
+    });
+  }
+
+  void _cancelStressMeasurement() {
+    _stressMeasureTicker?.cancel();
+    _stressMeasureTicker = null;
+    if (!mounted) return;
+    setState(() {
+      _stressMeasureActive = false;
+      _stressMeasureStartedAt = null;
+      _measureLiveIssue = "Measurement cancelled";
+    });
+  }
+
+  void _finalizeStressMeasurement() {
+    if (!_stressMeasureActive) return;
+    _stressMeasureTicker?.cancel();
+    _stressMeasureTicker = null;
+
+    final enough = _measureValidSamples >= _measureMinValidSamples && _measureScores.isNotEmpty;
+    _MeasureSummary? summary;
+    if (enough) {
+      final meanScore = _measureScores.reduce((a, b) => a + b) / _measureScores.length;
+      final meanConfidence = _measureConfidences.isEmpty
+          ? 0.0
+          : _measureConfidences.reduce((a, b) => a + b) / _measureConfidences.length;
+      final level = meanScore >= 0.67 ? "High" : (meanScore >= 0.34 ? "Medium" : "Low");
+      summary = _MeasureSummary(
+        score: meanScore,
+        confidence: meanConfidence,
+        level: level,
+        validSamples: _measureValidSamples,
+        invalidSamples: _measureInvalidSamples,
+      );
+    }
+
+    if (!mounted) return;
+    setState(() {
+      _stressMeasureActive = false;
+      _stressMeasureStartedAt = null;
+      _lastMeasureSummary = summary;
+      if (summary == null) {
+        _measureLiveIssue = "Not enough valid samples. Re-measure with better sensor contact.";
+      } else {
+        _measureLiveIssue = null;
+      }
+    });
+
+    showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text("Stress measurement result"),
+        content: summary == null
+            ? Text("Measurement ended but valid samples were too low.\n\nValid: $_measureValidSamples\nInvalid: $_measureInvalidSamples")
+            : Text(
+                "Final stress level: ${summary.level}\n"
+                "Stress score: ${summary.score.toStringAsFixed(3)}\n"
+                "Confidence: ${(summary.confidence * 100).toStringAsFixed(0)}%\n"
+                "Cortisol proxy: ${(summary.score * 100).toStringAsFixed(1)}\n"
+                "Valid samples: ${summary.validSamples}\n"
+                "Invalid samples: ${summary.invalidSamples}",
+              ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(),
+            child: const Text("Close"),
+          ),
+        ],
+      ),
+    );
+  }
 
   String _fmtDuration(Duration d) {
     final total = d.inSeconds < 0 ? 0 : d.inSeconds;
@@ -665,6 +800,10 @@ class _BleHomeState extends State<BleHome> {
   Future<void> _disconnect() async {
     final d = _device;
     if (d == null) return;
+    if (_stressMeasureActive) {
+      _cancelStressMeasurement();
+      unawaited(_showToast("Stress measurement stopped: device disconnected"));
+    }
     if (_guidedCalibrationActive) {
       _stopGuidedCalibration();
       unawaited(_showToast("Calibration stopped: device disconnected"));
@@ -769,6 +908,10 @@ class _BleHomeState extends State<BleHome> {
         _isConnected = s == BluetoothConnectionState.connected;
       });
       if (s == BluetoothConnectionState.disconnected) {
+        if (_stressMeasureActive) {
+          _cancelStressMeasurement();
+          unawaited(_showToast("Stress measurement stopped: device disconnected"));
+        }
         if (_guidedCalibrationActive) {
           _stopGuidedCalibration();
           unawaited(_showToast("Calibration stopped: device disconnected"));
@@ -1014,6 +1157,12 @@ class _BleHomeState extends State<BleHome> {
       stressIssue = "Stress requires valid GSR";
     } else if (!tempValid) {
       stressIssue = "Stress requires valid temperature";
+    } else {
+      stressIssue = _plausibilityIssue(
+        bpmAvg: bpmNow?.avg,
+        gsrAvg: gsrNow?.avg,
+        tempAvg: tempAvgNow,
+      );
     }
 
     StressInferenceResult? inference;
@@ -1037,6 +1186,7 @@ class _BleHomeState extends State<BleHome> {
 
     HistoryEntry? createdEntry;
 
+    bool finalizeMeasure = false;
     setState(() {
       _ts = ts ?? _ts;
       _bpm = bpm ?? _bpm;
@@ -1077,6 +1227,21 @@ class _BleHomeState extends State<BleHome> {
         if (_tempHistory.length > 30) _tempHistory.removeAt(0);
       }
 
+      if (_stressMeasureActive) {
+        if (inference != null && stressIssue == null) {
+          _measureScores.add(inference.stressProbability);
+          _measureConfidences.add(inference.confidence);
+          _measureValidSamples += 1;
+          _measureLiveIssue = null;
+        } else {
+          _measureInvalidSamples += 1;
+          _measureLiveIssue = stressIssue ?? "Waiting for enough window samples";
+        }
+        if (_stressMeasureRemaining == Duration.zero) {
+          finalizeMeasure = true;
+        }
+      }
+
       _parseStatus = "OK";
     });
 
@@ -1090,6 +1255,9 @@ class _BleHomeState extends State<BleHome> {
         _guidedCalibrationTimeDone) {
       _stopGuidedCalibration();
       unawaited(_showToast("Calibration complete"));
+    }
+    if (finalizeMeasure) {
+      _finalizeStressMeasurement();
     }
   }
 
@@ -1241,6 +1409,82 @@ class _BleHomeState extends State<BleHome> {
                 _MiniPill(text: "Parse $_parseStatus"),
                 _MiniPill(text: _stressResult?.levelText ?? "Stress N/A"),
                 _MiniPill(text: _stressEngine.calibrationReady ? "Calibrated" : "Uncalibrated"),
+              ],
+            ),
+          ),
+        ),
+        const SizedBox(height: 12),
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.all(14),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text("Measure stress", style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
+                const SizedBox(height: 6),
+                Text(
+                  _stressMeasureActive
+                      ? "Measuring now. Keep good sensor contact and stay still."
+                      : "Press Measure stress to run a timed measurement and get a final output.",
+                ),
+                const SizedBox(height: 10),
+                if (_stressMeasureActive) ...[
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      Text("Time left ${_fmtDuration(_stressMeasureRemaining)}"),
+                      Text(_fmtDuration(_stressMeasureElapsed)),
+                    ],
+                  ),
+                  const SizedBox(height: 6),
+                  LinearProgressIndicator(value: _stressMeasureProgress),
+                  const SizedBox(height: 10),
+                  Wrap(
+                    spacing: 8,
+                    runSpacing: 8,
+                    children: [
+                      _MiniPill(text: "Valid $_measureValidSamples"),
+                      _MiniPill(text: "Invalid $_measureInvalidSamples"),
+                      _MiniPill(text: "Min valid $_measureMinValidSamples"),
+                    ],
+                  ),
+                ],
+                if (_measureLiveIssue != null) ...[
+                  const SizedBox(height: 8),
+                  Text(
+                    _measureLiveIssue!,
+                    style: TextStyle(color: Theme.of(context).colorScheme.error),
+                  ),
+                ],
+                if (_lastMeasureSummary != null && !_stressMeasureActive) ...[
+                  const SizedBox(height: 8),
+                  Wrap(
+                    spacing: 8,
+                    runSpacing: 8,
+                    children: [
+                      _MiniPill(text: "Last ${_lastMeasureSummary!.level}"),
+                      _MiniPill(text: "Score ${_lastMeasureSummary!.score.toStringAsFixed(3)}"),
+                      _MiniPill(text: "Conf ${(100 * _lastMeasureSummary!.confidence).toStringAsFixed(0)}%"),
+                    ],
+                  ),
+                ],
+                const SizedBox(height: 10),
+                Wrap(
+                  spacing: 10,
+                  runSpacing: 10,
+                  children: [
+                    FilledButton.icon(
+                      onPressed: (_stressMeasureActive || !_connected) ? null : _startStressMeasurement,
+                      icon: const Icon(Icons.play_arrow),
+                      label: const Text("Measure stress"),
+                    ),
+                    OutlinedButton.icon(
+                      onPressed: _stressMeasureActive ? _cancelStressMeasurement : null,
+                      icon: const Icon(Icons.stop),
+                      label: const Text("Cancel"),
+                    ),
+                  ],
+                ),
               ],
             ),
           ),
@@ -2458,6 +2702,22 @@ class _ExplainTile extends StatelessWidget {
       ),
     );
   }
+}
+
+class _MeasureSummary {
+  final double score;
+  final double confidence;
+  final String level;
+  final int validSamples;
+  final int invalidSamples;
+
+  const _MeasureSummary({
+    required this.score,
+    required this.confidence,
+    required this.level,
+    required this.validSamples,
+    required this.invalidSamples,
+  });
 }
 
 class _CardSection extends StatelessWidget {
