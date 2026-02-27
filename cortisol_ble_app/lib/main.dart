@@ -151,6 +151,7 @@ class _BleHomeState extends State<BleHome> {
   int _measureInvalidSamples = 0;
   String? _measureLiveIssue;
   _MeasureSummary? _lastMeasureSummary;
+  int _calibrationInvalidSamples = 0;
   static const Duration _measureDuration = Duration(seconds: 60);
   static const int _measureMinValidSamples = 8;
 
@@ -265,6 +266,7 @@ class _BleHomeState extends State<BleHome> {
       _sessionLabel = SessionLabel.rest;
       _tabIndex = 1; // Dashboard
       _guidedCalibrationStartedAt = DateTime.now();
+      _calibrationInvalidSamples = 0;
     });
     _stressEngine.setCalibrationMode(true);
     _calibrationTicker?.cancel();
@@ -348,6 +350,7 @@ class _BleHomeState extends State<BleHome> {
     setState(() {
       _guidedCalibrationActive = false;
       _guidedCalibrationStartedAt = null;
+      _calibrationInvalidSamples = 0;
     });
     await _showToast("Calibration reset");
   }
@@ -511,6 +514,21 @@ class _BleHomeState extends State<BleHome> {
       );
     }
 
+    HistoryEntry? measuredEntry;
+    if (summary != null) {
+      measuredEntry = HistoryEntry(
+        when: DateTime.now(),
+        ts: _ts,
+        bpmAvg: _bpm?.avg,
+        gsrAvg: _gsr?.avg,
+        tempAvg: _temp,
+        stressProb: summary.score,
+        cortisolProxy: summary.score * 100.0,
+        stressLevel: summary.level,
+        label: _sessionLabel.value,
+      );
+    }
+
     if (!mounted) return;
     setState(() {
       _stressMeasureActive = false;
@@ -520,8 +538,13 @@ class _BleHomeState extends State<BleHome> {
         _measureLiveIssue = "Not enough valid samples. Re-measure with better sensor contact.";
       } else {
         _measureLiveIssue = null;
+        _history.add(measuredEntry!);
+        if (_history.length > 300) _history.removeAt(0);
       }
     });
+    if (measuredEntry != null) {
+      unawaited(_appendHistoryLog(measuredEntry));
+    }
 
     showDialog<void>(
       context: context,
@@ -564,6 +587,7 @@ class _BleHomeState extends State<BleHome> {
     Navigator.of(context).push(
       MaterialPageRoute(
         builder: (_) => _StressDetailsPage(
+          measuredSummary: _lastMeasureSummary,
           stressResult: _stressResult,
           stressInputIssue: _stressInputIssue,
           mlModelLoaded: _mlModelLoaded,
@@ -1184,8 +1208,6 @@ class _BleHomeState extends State<BleHome> {
       );
     }
 
-    HistoryEntry? createdEntry;
-
     bool finalizeMeasure = false;
     setState(() {
       _ts = ts ?? _ts;
@@ -1197,19 +1219,6 @@ class _BleHomeState extends State<BleHome> {
         _stressResult = inference;
         _stressHistory.add(inference.stressProbability);
         if (_stressHistory.length > 60) _stressHistory.removeAt(0);
-        createdEntry = HistoryEntry(
-          when: DateTime.now(),
-          ts: _ts ?? tsVal,
-          bpmAvg: (_bpm ?? bpmNow)?.avg,
-          gsrAvg: (_gsr ?? gsrNow)?.avg,
-          tempAvg: _temp ?? tempAvgNow,
-          stressProb: inference.stressProbability,
-          cortisolProxy: inference.cortisolProxy,
-          stressLevel: inference.levelText,
-          label: _sessionLabel.value,
-        );
-        _history.add(createdEntry!);
-        if (_history.length > 300) _history.removeAt(0);
       } else if (stressIssue != null) {
         _stressResult = null;
       }
@@ -1241,13 +1250,12 @@ class _BleHomeState extends State<BleHome> {
           finalizeMeasure = true;
         }
       }
+      if (_guidedCalibrationActive && stressIssue != null) {
+        _calibrationInvalidSamples += 1;
+      }
 
       _parseStatus = "OK";
     });
-
-    if (createdEntry != null) {
-      unawaited(_appendHistoryLog(createdEntry!));
-    }
     unawaited(_persistCalibrationIfNeeded());
 
     if (_guidedCalibrationActive &&
@@ -1538,6 +1546,8 @@ class _BleHomeState extends State<BleHome> {
                       ),
                     ],
                   ),
+                  const SizedBox(height: 6),
+                  Text("Invalid ignored $_calibrationInvalidSamples"),
                 ],
               ),
             ),
@@ -1550,6 +1560,8 @@ class _BleHomeState extends State<BleHome> {
           temp: _temp,
           stressResult: _stressResult,
           stressInputIssue: _stressInputIssue,
+          measuredSummary: _lastMeasureSummary,
+          stressMeasureActive: _stressMeasureActive,
           mlModelLoaded: _mlModelLoaded,
           calibrationWindows: _stressEngine.baselineCollected,
           calibrationTarget: _stressEngine.baselineTarget,
@@ -1652,6 +1664,7 @@ class _BleHomeState extends State<BleHome> {
                 children: [
                   _MiniPill(text: "Status ${_stressEngine.calibrationReady ? "Ready" : "Not ready"}"),
                   _MiniPill(text: "Valid samples ${_stressEngine.baselineCollected} (min ${_stressEngine.baselineTarget})"),
+                  _MiniPill(text: "Invalid ignored $_calibrationInvalidSamples"),
                   _MiniPill(text: "Time ${_fmtMinuteProgress(_guidedCalibrationElapsed, _minCalibrationDuration)}"),
                   _MiniPill(text: "Time left ${_fmtDuration(_guidedCalibrationRemaining)}"),
                   _MiniPill(text: "Mode ${_guidedCalibrationActive ? "Calibrating" : "Idle"}"),
@@ -2113,6 +2126,8 @@ class _MetricsGrid extends StatelessWidget {
   final double? temp;
   final StressInferenceResult? stressResult;
   final String? stressInputIssue;
+  final _MeasureSummary? measuredSummary;
+  final bool stressMeasureActive;
   final bool mlModelLoaded;
   final int calibrationWindows;
   final int calibrationTarget;
@@ -2140,6 +2155,8 @@ class _MetricsGrid extends StatelessWidget {
     required this.temp,
     required this.stressResult,
     required this.stressInputIssue,
+    required this.measuredSummary,
+    required this.stressMeasureActive,
     required this.mlModelLoaded,
     required this.calibrationWindows,
     required this.calibrationTarget,
@@ -2163,19 +2180,20 @@ class _MetricsGrid extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    String hMin(List<double> xs) =>
-        xs.isEmpty ? "N/A" : xs.reduce(min).toStringAsFixed(2);
-    String hMax(List<double> xs) =>
-        xs.isEmpty ? "N/A" : xs.reduce(max).toStringAsFixed(2);
+    double? sessionAvg(List<double> xs, double? fallback) {
+      if (xs.isEmpty) return fallback;
+      final sum = xs.reduce((a, b) => a + b);
+      return sum / xs.length;
+    }
 
-    final stressText = stressResult?.levelText ?? "N/A";
-    final confidencePct = stressResult == null ? "N/A" : "${(stressResult!.confidence * 100).toStringAsFixed(0)}%";
-    final confidenceLevel = stressResult == null
+    final stressText = stressMeasureActive ? "Measuring..." : (measuredSummary?.level ?? "Not measured");
+    final confidenceCombined = measuredSummary == null
         ? "N/A"
-        : (stressResult!.confidence >= 0.75
-            ? "High"
-            : (stressResult!.confidence >= 0.45 ? "Medium" : "Low"));
-    final proxyText = stressResult == null ? "N/A" : stressResult!.cortisolProxy.toStringAsFixed(1);
+        : "${(measuredSummary!.confidence * 100).toStringAsFixed(0)}% "
+            "(${measuredSummary!.confidence >= 0.75 ? "High" : (measuredSummary!.confidence >= 0.45 ? "Medium" : "Low")})";
+    final bpmAvgDisplay = _fmt(sessionAvg(bpmHistory, bpm?.avg));
+    final gsrAvgDisplay = _fmt(sessionAvg(gsrHistory, gsr?.avg));
+    final tempAvgDisplay = _fmt(sessionAvg(tempHistory, temp));
 
     return Card(
       child: Padding(
@@ -2183,7 +2201,9 @@ class _MetricsGrid extends StatelessWidget {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            const Text("Live metrics", style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
+            const Text("Live averages", style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
+            const SizedBox(height: 4),
+            const Text("Simple view for BPM, GSR, and temperature"),
             const SizedBox(height: 10),
             Wrap(
               spacing: 10,
@@ -2193,45 +2213,25 @@ class _MetricsGrid extends StatelessWidget {
                   title: "BPM",
                   icon: Icons.favorite,
                   accent: const Color(0xFFE11D48),
-                  primaryValue: _fmt(bpm?.avg),
-                  primaryUnit: "bpm avg",
-                  details: [
-                    ("Window min", _fmt(bpm?.min)),
-                    ("Window max", _fmt(bpm?.max)),
-                    ("Window std", _fmt(bpm?.std)),
-                    ("Session min(avg)", hMin(bpmHistory)),
-                    ("Session max(avg)", hMax(bpmHistory)),
-                    ("Last ts", ts?.toString() ?? "N/A"),
-                  ],
+                  primaryValue: bpmAvgDisplay,
+                  primaryUnit: "Average BPM",
+                  details: const [],
                 ),
                 _ExpandableMetricCard(
                   title: "GSR",
                   icon: Icons.waves,
                   accent: const Color(0xFF14B8A6),
-                  primaryValue: _fmt(gsr?.avg),
-                  primaryUnit: "avg",
-                  details: [
-                    ("Window min", _fmt(gsr?.min)),
-                    ("Window max", _fmt(gsr?.max)),
-                    ("Window std", _fmt(gsr?.std)),
-                    ("Session min(avg)", hMin(gsrHistory)),
-                    ("Session max(avg)", hMax(gsrHistory)),
-                    ("Samples", gsrHistory.length.toString()),
-                  ],
+                  primaryValue: gsrAvgDisplay,
+                  primaryUnit: "Average GSR",
+                  details: const [],
                 ),
                 _ExpandableMetricCard(
                   title: "Temperature",
                   icon: Icons.thermostat,
                   accent: const Color(0xFFF59E0B),
-                  primaryValue: _fmt(temp),
-                  primaryUnit: "deg C",
-                  details: [
-                    ("Raw ts", ts?.toString() ?? "N/A"),
-                    ("Session min(avg)", hMin(tempHistory)),
-                    ("Session max(avg)", hMax(tempHistory)),
-                    ("Calibration", calibrationReady ? "ready" : "$calibrationWindows/$calibrationTarget"),
-                    ("Inference window", "$windowSamples/$windowTarget"),
-                  ],
+                  primaryValue: tempAvgDisplay,
+                  primaryUnit: "Average °C",
+                  details: const [],
                 ),
                 _ExpandableMetricCard(
                   title: "Stress",
@@ -2240,18 +2240,7 @@ class _MetricsGrid extends StatelessWidget {
                   primaryValue: stressText,
                   primaryUnit: "level",
                   details: [
-                    ("Model", mlModelLoaded ? "trained model" : "fallback heuristic"),
-                    ("Confidence", confidencePct),
-                    ("Confidence level", confidenceLevel),
-                    ("Cortisol proxy", proxyText),
-                    ("Input", stressInputIssue ?? "all valid"),
-                    ("Calibrating now", guidedCalibrationActive ? "yes" : "no"),
-                    ("Calibration", calibrationReady ? "ready" : "not ready"),
-                    ("Valid samples", "$calibrationWindows (min $calibrationTarget)"),
-                    ("Calibration elapsed", calibrationElapsedMinuteText),
-                    ("Calibration time left", calibrationRemainingText),
-                    ("Calibration time target", calibrationTimeDone ? "done" : "in progress"),
-                    ("Inference window", "$windowSamples/$windowTarget"),
+                    ("Confidence", confidenceCombined),
                   ],
                   footer: Align(
                     alignment: Alignment.centerRight,
@@ -2276,7 +2265,7 @@ class _MetricsGrid extends StatelessWidget {
     );
   }
 
-  String _fmt(double? v) => v == null ? "N/A" : v.toStringAsFixed(2);
+  String _fmt(double? v) => v == null ? "N/A" : v.toStringAsFixed(1);
 }
 
 class _ExpandableMetricCard extends StatelessWidget {
@@ -2533,6 +2522,7 @@ class _GraphDetailPage extends StatelessWidget {
 }
 
 class _StressDetailsPage extends StatelessWidget {
+  final _MeasureSummary? measuredSummary;
   final StressInferenceResult? stressResult;
   final String? stressInputIssue;
   final bool mlModelLoaded;
@@ -2545,6 +2535,7 @@ class _StressDetailsPage extends StatelessWidget {
   final bool guidedCalibrationActive;
 
   const _StressDetailsPage({
+    required this.measuredSummary,
     required this.stressResult,
     required this.stressInputIssue,
     required this.mlModelLoaded,
@@ -2559,15 +2550,18 @@ class _StressDetailsPage extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final confidence = stressResult == null ? "N/A" : "${(stressResult!.confidence * 100).toStringAsFixed(0)}%";
-    final confidenceLevel = stressResult == null
+    final activeScore = measuredSummary?.score ?? stressResult?.stressProbability;
+    final activeConfidence = measuredSummary?.confidence ?? stressResult?.confidence;
+    final activeLevel = measuredSummary?.level ?? stressResult?.levelText;
+    final confidence = activeConfidence == null ? "N/A" : "${(activeConfidence * 100).toStringAsFixed(0)}%";
+    final confidenceLevel = activeConfidence == null
         ? "N/A"
-        : (stressResult!.confidence >= 0.75
+        : (activeConfidence >= 0.75
             ? "High"
-            : (stressResult!.confidence >= 0.45 ? "Medium" : "Low"));
-    final stressScore = stressResult == null ? "N/A" : stressResult!.stressProbability.toStringAsFixed(3);
-    final cortisolProxy = stressResult == null ? "N/A" : stressResult!.cortisolProxy.toStringAsFixed(1);
-    final stressLevel = stressResult?.levelText ?? "N/A";
+            : (activeConfidence >= 0.45 ? "Medium" : "Low"));
+    final stressScore = activeScore == null ? "N/A" : activeScore.toStringAsFixed(3);
+    final cortisolProxy = activeScore == null ? "N/A" : (activeScore * 100).toStringAsFixed(1);
+    final stressLevel = activeLevel ?? "N/A";
 
     return Scaffold(
       appBar: AppBar(title: const Text("Stress Details")),
@@ -2624,12 +2618,6 @@ class _StressDetailsPage extends StatelessWidget {
                   value: inferenceWindowText,
                   explanation:
                       "Inference window shows current buffered samples over required samples for feature extraction. It is not calibration progress.",
-                ),
-                _ExplainTile(
-                  title: "Model path",
-                  value: mlModelLoaded ? "Trained model ON" : "Fallback heuristic",
-                  explanation:
-                      "When model is loaded, output comes from exported RF model plus post-processing. If model is unavailable, fallback heuristic path is used.",
                 ),
               ],
             ),

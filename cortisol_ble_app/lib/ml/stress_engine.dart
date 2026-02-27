@@ -214,9 +214,11 @@ class StressEngine {
     final eda = canonical['gsr_avg'];
     final temp = canonical['temp_avg'];
     if (!_isValidSignal(hr) || !_isValidSignal(eda) || !_isValidSignal(temp)) return;
+    if (hr! < 45 || hr > 190) return;
+    if (temp! < 20 || temp > 45) return;
 
     _calibrationValidCount += 1;
-    _calibWindows.add(_CalibWindow(hrMean: hr!, edaMean: eda!, tempMean: temp!));
+    _calibWindows.add(_CalibWindow(hrMean: hr, edaMean: eda!, tempMean: temp));
     while (_calibWindows.length > baselineWindows) {
       _calibWindows.removeFirst();
     }
