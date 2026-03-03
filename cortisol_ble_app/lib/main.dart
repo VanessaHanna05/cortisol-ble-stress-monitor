@@ -1117,7 +1117,7 @@ class _BleHomeState extends State<BleHome> {
 
   void _processJson(Map<String, dynamic> obj) {
     int? ts;
-    final tsRaw = obj["ts"] ?? obj["TS"];
+    final tsRaw = obj["ts"] ?? obj["TS"] ?? obj["t"];
     if (tsRaw is num) ts = tsRaw.toInt();
     if (tsRaw is String) ts = int.tryParse(tsRaw);
 
@@ -1126,21 +1126,21 @@ class _BleHomeState extends State<BleHome> {
     MetricGroup? tempGroup;
     double? temp;
 
-    final bpmObj = obj["BPM"] ?? obj["bpm"];
+    final bpmObj = obj["BPM"] ?? obj["bpm"] ?? obj["b"];
     if (bpmObj is Map<String, dynamic>) {
       bpm = MetricGroup.fromMap(bpmObj);
     } else if (bpmObj is Map) {
       bpm = MetricGroup.fromMap(bpmObj.cast<String, dynamic>());
     }
 
-    final gsrObj = obj["GSR"] ?? obj["gsr"];
+    final gsrObj = obj["GSR"] ?? obj["gsr"] ?? obj["g"];
     if (gsrObj is Map<String, dynamic>) {
       gsr = MetricGroup.fromMap(gsrObj);
     } else if (gsrObj is Map) {
       gsr = MetricGroup.fromMap(gsrObj.cast<String, dynamic>());
     }
 
-    final tempObj = obj["Temp"] ?? obj["TEMP"] ?? obj["temp"] ?? obj["skinTemp"] ?? obj["temperature"];
+    final tempObj = obj["Temp"] ?? obj["TEMP"] ?? obj["temp"] ?? obj["skinTemp"] ?? obj["temperature"] ?? obj["tc"];
     if (tempObj is Map<String, dynamic>) {
       tempGroup = MetricGroup.fromMap(tempObj);
       temp = tempGroup.avg;
@@ -1886,10 +1886,10 @@ class MetricGroup {
 
   factory MetricGroup.fromMap(Map<String, dynamic> m) {
     return MetricGroup(
-      avg: _toDouble(m["avg"]),
-      min: _toDouble(m["min"]),
-      max: _toDouble(m["max"]),
-      std: _toDouble(m["std"]),
+      avg: _toDouble(m["avg"] ?? m["a"]),
+      min: _toDouble(m["min"] ?? m["m"]),
+      max: _toDouble(m["max"] ?? m["x"]),
+      std: _toDouble(m["std"] ?? m["s"]),
     );
   }
 }
@@ -2180,20 +2180,14 @@ class _MetricsGrid extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    double? sessionAvg(List<double> xs, double? fallback) {
-      if (xs.isEmpty) return fallback;
-      final sum = xs.reduce((a, b) => a + b);
-      return sum / xs.length;
-    }
-
     final stressText = stressMeasureActive ? "Measuring..." : (measuredSummary?.level ?? "Not measured");
     final confidenceCombined = measuredSummary == null
         ? "N/A"
         : "${(measuredSummary!.confidence * 100).toStringAsFixed(0)}% "
             "(${measuredSummary!.confidence >= 0.75 ? "High" : (measuredSummary!.confidence >= 0.45 ? "Medium" : "Low")})";
-    final bpmAvgDisplay = _fmt(sessionAvg(bpmHistory, bpm?.avg));
-    final gsrAvgDisplay = _fmt(sessionAvg(gsrHistory, gsr?.avg));
-    final tempAvgDisplay = _fmt(sessionAvg(tempHistory, temp));
+    final bpmAvgDisplay = _fmt(bpm?.avg);
+    final gsrAvgDisplay = _fmt(gsr?.avg);
+    final tempAvgDisplay = _fmt(temp);
 
     return Card(
       child: Padding(
