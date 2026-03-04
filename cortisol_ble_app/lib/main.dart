@@ -78,6 +78,7 @@ extension SessionLabelX on SessionLabel {
 
 class _BleHomeState extends State<BleHome> {
   final Guid knownCharUuid = Guid("abcd1234-5678-1234-5678-abcdef123456");
+  final Guid heartbeatCharUuid = Guid("abcd1234-5678-1234-5678-abcdef123457");
   final Guid? knownServiceUuid = null;
   static const String _serviceChangedUuid = "00002a0500001000800000805f9b34fb";
 
@@ -88,6 +89,7 @@ class _BleHomeState extends State<BleHome> {
   StreamSubscription<BluetoothConnectionState>? _connSub;
 
   BluetoothCharacteristic? _notifyChar;
+  BluetoothCharacteristic? _heartbeatChar;
   StreamSubscription<List<int>>? _notifySub;
   StreamSubscription<List<int>>? _notifySubAlt;
 
@@ -102,11 +104,13 @@ class _BleHomeState extends State<BleHome> {
   DateTime? _lastAutoReconnectAt;
   Timer? _notifyWatchdog;
   Timer? _autoReconnectTimer;
+  Timer? _heartbeatTimer;
+  int _heartbeatWriteFailures = 0;
 
   String _status = "Idle";
   String _parseStatus = "Waiting";
   String _raw = "";
-  String _deviceNameFilter = "ESP32_HealthMonitor";
+  String _deviceNameFilter = "";
   String? _lastError;
   late final TextEditingController _filterController;
 
@@ -402,6 +406,7 @@ class _BleHomeState extends State<BleHome> {
     _notifySubAlt?.cancel();
     _notifyWatchdog?.cancel();
     _autoReconnectTimer?.cancel();
+    _heartbeatTimer?.cancel();
     _calibrationTicker?.cancel();
     _stressMeasureTicker?.cancel();
     _device?.disconnect();
@@ -544,6 +549,9 @@ class _BleHomeState extends State<BleHome> {
     });
     if (measuredEntry != null) {
       unawaited(_appendHistoryLog(measuredEntry));
+    }
+    if (summary != null) {
+      unawaited(_sendStressResultToDevice(summary));
     }
 
     showDialog<void>(
@@ -837,6 +845,9 @@ class _BleHomeState extends State<BleHome> {
     await _notifySubAlt?.cancel();
     _notifySub = null;
     _notifySubAlt = null;
+    _heartbeatTimer?.cancel();
+    _heartbeatTimer = null;
+    _heartbeatChar = null;
 
     try {
       if (_notifyChar != null) {
@@ -859,6 +870,61 @@ class _BleHomeState extends State<BleHome> {
       _reconnecting = false;
       _isConnected = false;
       _status = "Disconnected";
+    });
+  }
+
+  Future<void> _resetSensorSession() async {
+    final hb = _heartbeatChar;
+    if (hb == null || !_connected) {
+      await _showToast("Reset unavailable. Connect first.");
+      return;
+    }
+    try {
+      await _writeHeartbeat("RESET");
+    } catch (_) {}
+    await _showToast("Reset command sent. Sensor should be reconnectable shortly.");
+    await _disconnect();
+  }
+
+  Future<void> _writeHeartbeat(String payload) async {
+    final hb = _heartbeatChar;
+    if (hb == null) return;
+    final bytes = utf8.encode(payload);
+    final preferNoResp = hb.properties.writeWithoutResponse;
+    final firstMode = preferNoResp;
+    try {
+      await hb.write(bytes, withoutResponse: firstMode);
+      _heartbeatWriteFailures = 0;
+      return;
+    } catch (_) {
+      // Retry once using the opposite write mode.
+    }
+    try {
+      await hb.write(bytes, withoutResponse: !firstMode);
+      _heartbeatWriteFailures = 0;
+    } catch (e) {
+      _heartbeatWriteFailures += 1;
+      if (_heartbeatWriteFailures >= 3) {
+        _setError("Heartbeat write failed repeatedly: $e");
+      }
+    }
+  }
+
+  Future<void> _sendStressResultToDevice(_MeasureSummary summary) async {
+    if (!_connected) return;
+    final safeLevel = summary.level.replaceAll("|", "/").trim();
+    final payload =
+        "RESULT|$safeLevel|${summary.score.toStringAsFixed(3)}|${summary.confidence.toStringAsFixed(3)}";
+    await _writeHeartbeat(payload);
+  }
+
+  void _startHeartbeat() {
+    _heartbeatTimer?.cancel();
+    _heartbeatTimer = Timer.periodic(const Duration(seconds: 5), (_) async {
+      if (!_connected || _connecting || _reconnecting) return;
+      final hb = _heartbeatChar;
+      if (hb == null) return;
+      await _writeHeartbeat("HB");
     });
   }
 
@@ -918,6 +984,9 @@ class _BleHomeState extends State<BleHome> {
     _notifySub = null;
     _notifySubAlt = null;
     _notifyChar = null;
+    _heartbeatChar = null;
+    _heartbeatTimer?.cancel();
+    _heartbeatTimer = null;
     await _connSub?.cancel();
     _connSub = null;
 
@@ -945,6 +1014,9 @@ class _BleHomeState extends State<BleHome> {
         _notifySub = null;
         _notifySubAlt = null;
         _notifyChar = null;
+        _heartbeatChar = null;
+        _heartbeatTimer?.cancel();
+        _heartbeatTimer = null;
       }
     });
 
@@ -1004,6 +1076,11 @@ class _BleHomeState extends State<BleHome> {
     }
 
     _notifyChar = target;
+    _heartbeatChar = _findHeartbeatCharacteristic(services);
+    _heartbeatWriteFailures = 0;
+    if (_heartbeatChar == null) {
+      _setError("Heartbeat characteristic not found. Remove old bond/app cache and reconnect.");
+    }
 
     final notifyOk = await _enableNotifyWithRetry(target);
     if (!notifyOk) {
@@ -1019,6 +1096,8 @@ class _BleHomeState extends State<BleHome> {
     await _notifySubAlt?.cancel();
     _attachNotifyStreams(target);
     _lastNotifyAt = DateTime.now();
+    _startHeartbeat();
+    unawaited(_writeHeartbeat("HB"));
 
     // Optional initial read
     try {
@@ -1037,6 +1116,16 @@ class _BleHomeState extends State<BleHome> {
       _parseStatus = "Listening";
     });
     _maybePromptCalibration();
+  }
+
+  BluetoothCharacteristic? _findHeartbeatCharacteristic(List<BluetoothService> services) {
+    for (final s in services) {
+      for (final c in s.characteristics) {
+        if (_normGuid(c.uuid) != _normGuid(heartbeatCharUuid)) continue;
+        if (c.properties.write || c.properties.writeWithoutResponse) return c;
+      }
+    }
+    return null;
   }
 
   Future<List<BluetoothService>> _discoverServicesWithRetry(BluetoothDevice d) async {
@@ -1345,6 +1434,15 @@ class _BleHomeState extends State<BleHome> {
             scanning: _scanning,
             connecting: _connecting,
             connected: _connected,
+            canReconnectLast: !_connected && _lastConnectedScan != null && !_reconnecting,
+            onAutoFilterEsp32: () {
+              const target = "ESP32_HealthMonitor";
+              setState(() {
+                _deviceNameFilter = target;
+                _filterController.text = target;
+                _applyFilterToExistingResults();
+              });
+            },
             connectedName: connectedName,
             parseStatus: _parseStatus,
             mlModelLoaded: _mlModelLoaded,
@@ -1359,6 +1457,7 @@ class _BleHomeState extends State<BleHome> {
             onStopScan: _stopScan,
             onDisconnect: _disconnect,
             onReconnect: _reconnect,
+            onResetSession: _resetSensorSession,
           ),
           const SizedBox(height: 12),
           _CardSection(
@@ -1846,7 +1945,7 @@ class _BleHomeState extends State<BleHome> {
           ? FloatingActionButton.extended(
               onPressed: _reconnecting ? null : _reconnect,
               icon: const Icon(Icons.refresh),
-              label: Text(_reconnecting ? "Reconnecting" : "Reconnect"),
+              label: Text(_reconnecting ? "Refreshing" : "Refresh"),
             )
           : null,
       body: IndexedStack(
@@ -2003,29 +2102,35 @@ class _TopActions extends StatelessWidget {
   final bool scanning;
   final bool connecting;
   final bool connected;
+  final bool canReconnectLast;
   final String? connectedName;
   final String parseStatus;
   final bool mlModelLoaded;
   final TextEditingController filterController;
   final ValueChanged<String> onFilterChanged;
+  final VoidCallback onAutoFilterEsp32;
   final VoidCallback onScan;
   final VoidCallback onStopScan;
   final VoidCallback onDisconnect;
   final VoidCallback onReconnect;
+  final VoidCallback onResetSession;
 
   const _TopActions({
     required this.scanning,
     required this.connecting,
     required this.connected,
+    required this.canReconnectLast,
     required this.connectedName,
     required this.parseStatus,
     required this.mlModelLoaded,
     required this.filterController,
     required this.onFilterChanged,
+    required this.onAutoFilterEsp32,
     required this.onScan,
     required this.onStopScan,
     required this.onDisconnect,
     required this.onReconnect,
+    required this.onResetSession,
   });
 
   @override
@@ -2064,6 +2169,18 @@ class _TopActions extends StatelessWidget {
                     icon: const Icon(Icons.refresh),
                     label: const Text("Reconnect"),
                   ),
+                if (canReconnectLast)
+                  FilledButton.tonalIcon(
+                    onPressed: onReconnect,
+                    icon: const Icon(Icons.history_toggle_off),
+                    label: const Text("Reconnect last"),
+                  ),
+                if (connected)
+                  OutlinedButton.icon(
+                    onPressed: onResetSession,
+                    icon: const Icon(Icons.restart_alt),
+                    label: const Text("Reset sensor session"),
+                  ),
               ],
             ),
             const SizedBox(height: 12),
@@ -2075,6 +2192,18 @@ class _TopActions extends StatelessWidget {
                 border: OutlineInputBorder(),
               ),
               onChanged: onFilterChanged,
+            ),
+            const SizedBox(height: 8),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                OutlinedButton.icon(
+                  onPressed: onAutoFilterEsp32,
+                  icon: const Icon(Icons.filter_alt),
+                  label: const Text("Auto filter ESP32"),
+                ),
+              ],
             ),
             const SizedBox(height: 12),
             Container(
