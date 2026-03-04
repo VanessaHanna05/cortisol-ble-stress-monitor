@@ -8,31 +8,17 @@ struct Stats {
 };
 
 /*************************************************************
-  ESP32: BLE + Blynk + OLED + MAX30102 + MAX30205 + GSR
+  ESP32: BLE + OLED + MAX30102 + MAX30205 + GSR
 
   Behavior
   1) Sample BPM, Temp, GSR every 1 second
   2) Collect 10 samples
   3) Compute avg, min, max, std dev for each over the 10 samples
-  4) Send stats over BLE as a dictionary style JSON string:
-     {
-       "ts":123,
-       "BPM":{"avg":..,"min":..,"max":..,"std":..},
-       "GSR":{"avg":..,"min":..,"max":..,"std":..},
-       "Temp":{"avg":..,"min":..,"max":..,"std":..}
-     }
+  4) Send stats over BLE as a compact JSON string:
+     {"t":123,"b":{...},"g":{...},"tc":{... or null}}
 *************************************************************/
 
-#define BLYNK_TEMPLATE_ID           "TMPL5v8AJmv62"
-#define BLYNK_TEMPLATE_NAME         "Quickstart Device"
-#define BLYNK_AUTH_TOKEN            "KRwjwBtqGNB2AG7ht6aKEmfb8ETcxRtL"
-
-#define BLYNK_PRINT Serial
-
 #include <math.h>
-#include <WiFi.h>
-#include <WiFiClient.h>
-#include <BlynkSimpleEsp32.h>
 
 #include <Wire.h>
 #include "MAX30105.h"
@@ -47,10 +33,11 @@ struct Stats {
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <BLE2902.h>
+#include <BLESecurity.h>
 
-// -------------------- WiFi --------------------
-char ssid[] = "vnss";
-char pass[] = "12345678";
+#include <esp_gap_ble_api.h>
+#include <esp_gatt_defs.h>
+#include <esp_system.h>
 
 // -------------------- I2C pins --------------------
 #define SDA_PIN 21
@@ -58,13 +45,6 @@ char pass[] = "12345678";
 
 // -------------------- GSR --------------------
 #define GSR_PIN 34
-
-// -------------------- Blynk virtual pins --------------------
-#define VPIN_BPM   V4
-#define VPIN_TEMP  V5
-#define VPIN_GSR   V6
-
-BlynkTimer timer;
 
 // -------------------- MAX30102 --------------------
 MAX30105 particleSensor;
@@ -84,14 +64,6 @@ uint8_t max30205Addr = 0;
 
 float TEMP_OFFSET_C = 0.0f;
 
-uint8_t findMAX30205Addr() {
-  for (uint8_t a = 0x48; a <= 0x4F; a++) {
-    Wire.beginTransmission(a);
-    if (Wire.endTransmission() == 0) return a;
-  }
-  return 0;
-}
-
 // -------------------- OLED (SPI) --------------------
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
@@ -109,6 +81,69 @@ Adafruit_SSD1306 display(
 
 bool oled_ok = false;
 
+// -------------------- BLE SETUP --------------------
+#define BLE_DEVICE_NAME     "ESP32_HealthMonitor"
+#define SERVICE_UUID        "12345678-1234-1234-1234-1234567890ab"
+#define CHAR_UUID_NOTIFY    "abcd1234-5678-1234-5678-abcdef123456"
+#define CHAR_UUID_HEARTBEAT "abcd1234-5678-1234-5678-abcdef123457"
+
+BLEServer* pServer = nullptr;
+BLECharacteristic* pChar = nullptr;
+BLECharacteristic* pHeartbeatChar = nullptr;
+volatile bool bleClientConnected = false;
+volatile uint32_t lastHeartbeatMs = 0;
+volatile bool evtHeartbeatTimeout = false;
+static const uint32_t HEARTBEAT_TIMEOUT_MS = 30000; // drop stale links after 30s
+volatile uint32_t lastAdvKickMs = 0;
+static const uint32_t ADV_WATCHDOG_MS = 5000;
+volatile uint32_t lastStatusLogMs = 0;
+static const uint32_t STATUS_LOG_MS = 5000;
+volatile bool pendingBleSoftReboot = false;
+volatile uint32_t bleSoftRebootAtMs = 0;
+static const uint32_t BLE_SOFT_REBOOT_DELAY_MS = 1500;
+volatile bool evtResultReady = false;
+char pendingResultLevel[16] = "N/A";
+volatile float pendingResultScore = 0.0f;
+volatile float pendingResultConfidence = 0.0f;
+bool resultScreenActive = false;
+uint32_t resultScreenUntilMs = 0;
+char resultLevel[16] = "N/A";
+float resultScore = 0.0f;
+float resultConfidence = 0.0f;
+static const uint32_t RESULT_SHOW_MS = 15000; // show stress result on OLED for 15s
+static const uint32_t SAMPLE_INTERVAL_MS = 1000;
+uint32_t lastSampleMs = 0;
+
+// Dynamic passkey (changes on each passkey request)
+static uint32_t BLE_PASSKEY = 0;
+
+// ---- Deferred BLE events (safe UI handling in loop) ----
+volatile bool evtBleConnected = false;
+volatile bool evtBleDisconnected = false;
+volatile bool evtAuthSuccess = false;
+volatile bool evtAuthFail = false;
+volatile bool evtPasskeyShow = false;
+volatile uint32_t evtPasskey = 0;
+
+// ---- Pairing UI state ----
+volatile bool pairingPinActive = false;
+volatile uint32_t pairingPinValue = 0;
+volatile uint32_t pairingPinUntilMs = 0;
+static const uint32_t PIN_SHOW_MS = 120000; // 2 minutes
+
+static uint32_t genPasskey6() {
+  return 100000u + (esp_random() % 900000u);
+}
+
+uint8_t findMAX30205Addr() {
+  for (uint8_t a = 0x48; a <= 0x4F; a++) {
+    Wire.beginTransmission(a);
+    if (Wire.endTransmission() == 0) return a;
+  }
+  return 0;
+}
+
+// -------------------- OLED helpers --------------------
 void oledPrintStatus(const String& a, const String& b = "", const String& c = "") {
   if (!oled_ok) return;
   display.clearDisplay();
@@ -121,8 +156,32 @@ void oledPrintStatus(const String& a, const String& b = "", const String& c = ""
   display.display();
 }
 
+void oledShowPairingPinLarge(uint32_t pin, bool connected) {
+  if (!oled_ok) return;
+
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.print("BLE Pairing PIN");
+
+  display.setTextSize(3);
+  display.setCursor(8, 20);
+  char pinBuf[7];
+  snprintf(pinBuf, sizeof(pinBuf), "%06lu", (unsigned long)pin);
+  display.print(pinBuf);
+
+  display.setTextSize(1);
+  display.setCursor(0, 56);
+  display.print(connected ? "Connected: enter PIN" : "Waiting for phone...");
+  display.display();
+}
+
 void updateOLEDStats(float bpmAvg, float tempAvg, float gsrAvg) {
   if (!oled_ok) return;
+  if (pairingPinActive) return; // don't overwrite pairing PIN screen
+  if (resultScreenActive) return; // don't overwrite stress result screen
 
   display.clearDisplay();
   display.setTextColor(SSD1306_WHITE);
@@ -144,7 +203,32 @@ void updateOLEDStats(float bpmAvg, float tempAvg, float gsrAvg) {
   display.print((int)(gsrAvg + 0.5f));
 
   display.setCursor(92, 44);
-  display.print(Blynk.connected() ? "BK" : "--");
+  display.print("--");
+
+  display.display();
+}
+
+void oledShowStressResult(const char* level, float score, float confidence) {
+  if (!oled_ok) return;
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.print("Stress Result");
+
+  display.setCursor(0, 16);
+  display.print("Level: ");
+  display.print(level);
+
+  display.setCursor(0, 32);
+  display.print("Score: ");
+  display.print(score, 3);
+
+  display.setCursor(0, 48);
+  display.print("Conf: ");
+  display.print((int)(confidence * 100.0f + 0.5f));
+  display.print("%");
 
   display.display();
 }
@@ -159,28 +243,109 @@ int readGsrAverage() {
   return (int)(sum / 10);
 }
 
-// ==================== BLE SETUP ====================
-#define BLE_DEVICE_NAME     "ESP32_HealthMonitor"
-#define SERVICE_UUID        "12345678-1234-1234-1234-1234567890ab"
-#define CHAR_UUID_NOTIFY    "abcd1234-5678-1234-5678-abcdef123456"
+// -------------------- BLE callbacks --------------------
+class MySecurityCallbacks : public BLESecurityCallbacks {
+  uint32_t onPassKeyRequest() override {
+    BLE_PASSKEY = genPasskey6();
+    evtPasskey = BLE_PASSKEY;
+    evtPasskeyShow = true;
+    return BLE_PASSKEY;
+  }
 
-BLEServer* pServer = nullptr;
-BLECharacteristic* pChar = nullptr;
-volatile bool bleClientConnected = false;
+  void onPassKeyNotify(uint32_t pass_key) override {
+    evtPasskey = pass_key;
+    evtPasskeyShow = true;
+  }
+
+  bool onConfirmPIN(uint32_t pass_key) override {
+    Serial.print("Confirm passkey: ");
+    Serial.println(pass_key);
+    return true;
+  }
+
+  bool onSecurityRequest() override {
+    return true;
+  }
+
+  void onAuthenticationComplete(esp_ble_auth_cmpl_t auth_cmpl) override {
+    if (!auth_cmpl.success) {
+      evtAuthFail = true;
+      return;
+    }
+    evtAuthSuccess = true;
+  }
+};
 
 class MyServerCallbacks : public BLEServerCallbacks {
-  void onConnect(BLEServer* server) override { bleClientConnected = true; }
+  void onConnect(BLEServer* server) override {
+    (void)server;
+    bleClientConnected = true;
+    lastHeartbeatMs = millis();
+    evtBleConnected = true;
+  }
+
   void onDisconnect(BLEServer* server) override {
+    (void)server;
     bleClientConnected = false;
+    evtBleDisconnected = true;
+    pendingBleSoftReboot = true;
+    bleSoftRebootAtMs = millis() + BLE_SOFT_REBOOT_DELAY_MS;
     BLEDevice::startAdvertising();
   }
 };
 
-void setupBLE() {
-  // Helps fit the JSON payload without truncation
-  BLEDevice::setMTU(247);
+void forceBleDisconnect(const char* reason) {
+  if (!pServer) return;
+  uint16_t connId = pServer->getConnId();
+  Serial.print("Forcing BLE disconnect: ");
+  Serial.println(reason);
+  pServer->disconnect(connId);
+}
 
+class HeartbeatCallbacks : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic* characteristic) override {
+    if (!characteristic) return;
+    String value = characteristic->getValue();
+    lastHeartbeatMs = millis();
+    if (value.startsWith("RESULT|")) {
+      int p1 = value.indexOf('|');
+      int p2 = value.indexOf('|', p1 + 1);
+      int p3 = value.indexOf('|', p2 + 1);
+      if (p1 >= 0 && p2 > p1 && p3 > p2) {
+        String lvl = value.substring(p1 + 1, p2);
+        String scoreStr = value.substring(p2 + 1, p3);
+        String confStr = value.substring(p3 + 1);
+
+        if (lvl.length() == 0) lvl = "N/A";
+        lvl.toCharArray(pendingResultLevel, sizeof(pendingResultLevel));
+        pendingResultScore = scoreStr.toFloat();
+        pendingResultConfidence = confStr.toFloat();
+        evtResultReady = true;
+        Serial.println("BLE stress result received");
+      }
+      return;
+    }
+    Serial.println("BLE heartbeat received");
+    if (value == "RESET") {
+      forceBleDisconnect("remote reset request");
+    }
+  }
+};
+
+void setupBLE() {
+  BLEDevice::setMTU(185);
   BLEDevice::init(BLE_DEVICE_NAME);
+
+  BLESecurity* security = new BLESecurity();
+  security->setAuthenticationMode(ESP_LE_AUTH_REQ_SC_MITM_BOND);
+  security->setCapability(ESP_IO_CAP_OUT);
+  security->setInitEncryptionKey(ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK);
+  security->setRespEncryptionKey(ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK);
+  security->setKeySize(16);
+
+  // Dynamic passkey via callbacks
+  BLEDevice::setSecurityCallbacks(new MySecurityCallbacks());
+
   pServer = BLEDevice::createServer();
   pServer->setCallbacks(new MyServerCallbacks());
 
@@ -192,8 +357,17 @@ void setupBLE() {
     BLECharacteristic::PROPERTY_NOTIFY
   );
 
+  pChar->setAccessPermissions(ESP_GATT_PERM_READ_ENC_MITM);
   pChar->addDescriptor(new BLE2902());
   pChar->setValue("Booting...");
+
+  pHeartbeatChar = pService->createCharacteristic(
+    CHAR_UUID_HEARTBEAT,
+    BLECharacteristic::PROPERTY_WRITE |
+    BLECharacteristic::PROPERTY_WRITE_NR
+  );
+  pHeartbeatChar->setAccessPermissions(ESP_GATT_PERM_WRITE_ENC_MITM);
+  pHeartbeatChar->setCallbacks(new HeartbeatCallbacks());
 
   pService->start();
 
@@ -201,8 +375,51 @@ void setupBLE() {
   adv->addServiceUUID(SERVICE_UUID);
   adv->setScanResponse(true);
   adv->start();
+  lastAdvKickMs = millis();
 
   Serial.println("BLE advertising started");
+}
+
+void checkBleHeartbeatTimeout() {
+  if (!bleClientConnected) return;
+  uint32_t now = millis();
+  if ((uint32_t)(now - lastHeartbeatMs) <= HEARTBEAT_TIMEOUT_MS) return;
+  evtHeartbeatTimeout = true;
+  Serial.println("BLE heartbeat timeout");
+  forceBleDisconnect("heartbeat timeout");
+  lastHeartbeatMs = now;
+}
+
+void ensureBleAdvertisingAlive() {
+  if (bleClientConnected) return;
+  uint32_t now = millis();
+  if ((uint32_t)(now - lastAdvKickMs) < ADV_WATCHDOG_MS) return;
+  lastAdvKickMs = now;
+  BLEDevice::stopAdvertising();
+  delay(20);
+  BLEDevice::startAdvertising();
+  Serial.println("BLE advertising watchdog restart");
+}
+
+void logBleStatusIfNeeded() {
+  uint32_t now = millis();
+  if ((uint32_t)(now - lastStatusLogMs) < STATUS_LOG_MS) return;
+  lastStatusLogMs = now;
+  Serial.print("BLE status connected=");
+  Serial.print(bleClientConnected ? "1" : "0");
+  Serial.print(" hbAgeMs=");
+  Serial.print((unsigned long)(now - lastHeartbeatMs));
+  Serial.print(" advKickAgeMs=");
+  Serial.println((unsigned long)(now - lastAdvKickMs));
+}
+
+void rebootIfBleRequested() {
+  if (!pendingBleSoftReboot) return;
+  if ((int32_t)(millis() - bleSoftRebootAtMs) < 0) return;
+  pendingBleSoftReboot = false;
+  Serial.println("BLE soft reboot now");
+  delay(80);
+  ESP.restart();
 }
 
 // -------------------- Stats helpers --------------------
@@ -265,33 +482,34 @@ float tempBuf[WIN];
 float gsrBuf[WIN];
 int sampleCount = 0;
 
-// -------------------- BLE send stats as dictionary JSON --------------------
+// -------------------- BLE send stats as compact JSON --------------------
 void bleSendStatsJSON(uint32_t tsMs, const Stats& b, const Stats& t, const Stats& g) {
   if (!pChar) return;
 
-  char buf[320];
+  char buf[340];
+  int n = 0;
 
   if (!t.valid) {
-    snprintf(
+    n = snprintf(
       buf, sizeof(buf),
       "{"
-        "\"ts\":%lu,"
-        "\"BPM\":{\"avg\":%.2f,\"min\":%.2f,\"max\":%.2f,\"std\":%.2f},"
-        "\"GSR\":{\"avg\":%.2f,\"min\":%.2f,\"max\":%.2f,\"std\":%.2f},"
-        "\"Temp\":{\"avg\":null,\"min\":null,\"max\":null,\"std\":null}"
+      "\"ts\":%lu,"
+      "\"BPM\":{\"avg\":%.2f,\"min\":%.2f,\"max\":%.2f,\"std\":%.2f},"
+      "\"GSR\":{\"avg\":%.2f,\"min\":%.2f,\"max\":%.2f,\"std\":%.2f},"
+      "\"Temp\":{\"avg\":null,\"min\":null,\"max\":null,\"std\":null}"
       "}",
       (unsigned long)tsMs,
       b.avg, b.mn, b.mx, b.sd,
       g.avg, g.mn, g.mx, g.sd
     );
   } else {
-    snprintf(
+    n = snprintf(
       buf, sizeof(buf),
       "{"
-        "\"ts\":%lu,"
-        "\"BPM\":{\"avg\":%.2f,\"min\":%.2f,\"max\":%.2f,\"std\":%.2f},"
-        "\"GSR\":{\"avg\":%.2f,\"min\":%.2f,\"max\":%.2f,\"std\":%.2f},"
-        "\"Temp\":{\"avg\":%.2f,\"min\":%.2f,\"max\":%.2f,\"std\":%.2f}"
+      "\"ts\":%lu,"
+      "\"BPM\":{\"avg\":%.2f,\"min\":%.2f,\"max\":%.2f,\"std\":%.2f},"
+      "\"GSR\":{\"avg\":%.2f,\"min\":%.2f,\"max\":%.2f,\"std\":%.2f},"
+      "\"Temp\":{\"avg\":%.2f,\"min\":%.2f,\"max\":%.2f,\"std\":%.2f}"
       "}",
       (unsigned long)tsMs,
       b.avg, b.mn, b.mx, b.sd,
@@ -300,9 +518,13 @@ void bleSendStatsJSON(uint32_t tsMs, const Stats& b, const Stats& t, const Stats
     );
   }
 
-  pChar->setValue((uint8_t*)buf, strlen(buf));
+  if (n <= 0 || n >= (int)sizeof(buf)) return;
+
+  Serial.println(buf); // debug: verify payload
+  pChar->setValue((uint8_t*)buf, (size_t)n);
   if (bleClientConnected) pChar->notify();
 }
+
 
 // -------------------- every 1s: sample and every 10 samples: compute + send --------------------
 void sampleEvery1s() {
@@ -312,9 +534,9 @@ void sampleEvery1s() {
   float bpmNow = (float)beatAvg;
   float gsrNow = (float)readGsrAverage();
 
-  bpmBuf[sampleCount] = bpmNow;
+  bpmBuf[sampleCount]  = bpmNow;
   tempBuf[sampleCount] = tempC;
-  gsrBuf[sampleCount] = gsrNow;
+  gsrBuf[sampleCount]  = gsrNow;
 
   sampleCount++;
 
@@ -326,18 +548,101 @@ void sampleEvery1s() {
     uint32_t tsMs = millis();
 
     updateOLEDStats(b.avg, t.valid ? t.avg : NAN, g.avg);
-
-    // BLE JSON dictionary send
     bleSendStatsJSON(tsMs, b, t, g);
 
-    // Blynk sends window averages only
-    if (Blynk.connected()) {
-      Blynk.virtualWrite(VPIN_BPM, b.avg);
-      if (t.valid) Blynk.virtualWrite(VPIN_TEMP, t.avg);
-      Blynk.virtualWrite(VPIN_GSR, g.avg);
-    }
-
     sampleCount = 0;
+  }
+}
+
+// -------------------- Deferred BLE event processing --------------------
+void processBleEvents() {
+  if (evtPasskeyShow) {
+    evtPasskeyShow = false;
+    pairingPinValue = evtPasskey;
+    pairingPinActive = true;
+    pairingPinUntilMs = millis() + PIN_SHOW_MS;
+
+    Serial.print("BLE Passkey: ");
+    Serial.println((unsigned long)pairingPinValue);
+    oledShowPairingPinLarge(pairingPinValue, bleClientConnected);
+  }
+
+  if (evtBleConnected) {
+    evtBleConnected = false;
+    Serial.println("BLE connected");
+    if (pairingPinActive) {
+      oledShowPairingPinLarge(pairingPinValue, true);
+    } else if (oled_ok) {
+      oledPrintStatus("BLE connected", "Pair now on phone", "Use shown PIN");
+    }
+  }
+
+  if (evtBleDisconnected) {
+    evtBleDisconnected = false;
+    pairingPinActive = false;
+    lastAdvKickMs = millis();
+    Serial.println("BLE disconnected");
+    if (oled_ok) oledPrintStatus("BLE disconnected", "Advertising...");
+  }
+
+  if (evtAuthSuccess) {
+    evtAuthSuccess = false;
+    pairingPinActive = false;
+    Serial.println("BLE auth success (bonded)");
+    if (oled_ok) oledPrintStatus("BLE bonded", "Encrypted link");
+  }
+
+  if (evtAuthFail) {
+    evtAuthFail = false;
+    pairingPinActive = false;
+    Serial.println("BLE auth failed");
+    if (oled_ok) oledPrintStatus("BLE auth failed");
+  }
+
+  if (evtHeartbeatTimeout) {
+    evtHeartbeatTimeout = false;
+    if (oled_ok) oledPrintStatus("BLE timeout", "Restarting advertise");
+  }
+
+  if (evtResultReady) {
+    evtResultReady = false;
+    strncpy(resultLevel, pendingResultLevel, sizeof(resultLevel) - 1);
+    resultLevel[sizeof(resultLevel) - 1] = '\0';
+    resultScore = pendingResultScore;
+    resultConfidence = pendingResultConfidence;
+    resultScreenActive = true;
+    resultScreenUntilMs = millis() + RESULT_SHOW_MS;
+    oledShowStressResult(resultLevel, resultScore, resultConfidence);
+  }
+}
+
+void refreshPairingScreenIfNeeded() {
+  if (!pairingPinActive) return;
+
+  if ((int32_t)(millis() - pairingPinUntilMs) >= 0) {
+    pairingPinActive = false;
+    return;
+  }
+
+  static uint32_t lastPaint = 0;
+  if (millis() - lastPaint > 500) {
+    lastPaint = millis();
+    oledShowPairingPinLarge(pairingPinValue, bleClientConnected);
+  }
+}
+
+void refreshResultScreenIfNeeded() {
+  if (!resultScreenActive) return;
+
+  if ((int32_t)(millis() - resultScreenUntilMs) >= 0) {
+    resultScreenActive = false;
+    return;
+  }
+
+  static uint32_t lastPaint = 0;
+  if (millis() - lastPaint > 500) {
+    lastPaint = millis();
+    oledShowStressResult(resultLevel, resultScore, resultConfidence);
   }
 }
 
@@ -351,7 +656,7 @@ void setup() {
   else Serial.println("OLED init FAILED.");
 
   setupBLE();
-  if (oled_ok) oledPrintStatus("BLE Advertising", BLE_DEVICE_NAME);
+  if (oled_ok) oledPrintStatus("BLE Advertising", BLE_DEVICE_NAME, "Pair from phone");
 
   Wire.begin(SDA_PIN, SCL_PIN);
   Wire.setClock(100000);
@@ -367,9 +672,10 @@ void setup() {
     Serial.println("MAX30102 FAILED. Continuing without BPM.");
     if (oled_ok) oledPrintStatus("MAX30102 FAIL", "BPM will be 0");
   } else {
-    particleSensor.setup();
-    particleSensor.setPulseAmplitudeRed(0x0A);
-    particleSensor.setPulseAmplitudeGreen(0);
+    particleSensor.setup(0x3F, 4, 2, 100, 411, 4096); // bright, stable
+    particleSensor.setPulseAmplitudeRed(0x3F);         // visible LED
+    particleSensor.setPulseAmplitudeIR(0x3F);          // IR channel
+    particleSensor.setPulseAmplitudeGreen(0x00);
     Serial.println("MAX30102 OK.");
     if (oled_ok) oledPrintStatus("MAX30102 OK", "Red LED should be ON");
   }
@@ -391,42 +697,28 @@ void setup() {
     if (oled_ok) oledPrintStatus("MAX30205 OK", "Addr: 0x" + String(max30205Addr, HEX));
   }
 
-  Serial.println("WiFi connecting...");
-  if (oled_ok) oledPrintStatus("WiFi connecting...", ssid);
+  lastSampleMs = millis();
 
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(ssid, pass);
-
-  unsigned long t0 = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 6000) {
-    delay(200);
-    Serial.print(".");
+  if (oled_ok) {
+    oledPrintStatus("RUNNING",
+                    "BLE: ADV (pair phone)",
+                    "Cloud: OFF");
   }
-  Serial.println();
-
-  Blynk.config(BLYNK_AUTH_TOKEN);
-
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.print("WiFi OK IP: ");
-    Serial.println(WiFi.localIP());
-    if (oled_ok) oledPrintStatus("WiFi OK", WiFi.localIP().toString(), "Connecting Blynk...");
-    Blynk.connect(3000);
-  } else {
-    Serial.println("WiFi FAIL (Blynk offline). BLE still works.");
-    if (oled_ok) oledPrintStatus("WiFi FAIL", "Blynk offline", "BLE still works");
-  }
-
-  // sample every 1 second
-  timer.setInterval(1000L, sampleEvery1s);
-
-  if (oled_ok) oledPrintStatus("RUNNING",
-                               String("Blynk: ") + (Blynk.connected() ? "ON" : "OFF"),
-                               String("BLE: ADV"));
 }
 
 void loop() {
-  if (Blynk.connected()) Blynk.run();
-  timer.run();
+  processBleEvents();
+  refreshPairingScreenIfNeeded();
+  refreshResultScreenIfNeeded();
+
+  if (millis() - lastSampleMs >= SAMPLE_INTERVAL_MS) {
+    lastSampleMs += SAMPLE_INTERVAL_MS;
+    sampleEvery1s();
+  }
+  checkBleHeartbeatTimeout();
+  ensureBleAdvertisingAlive();
+  logBleStatusIfNeeded();
+  rebootIfBleRequested();
 
   // MAX30102 BPM update loop
   if (max30102_ok) {
@@ -451,7 +743,7 @@ void loop() {
         }
       }
 
-      if (irValue < 50000) beatAvg = 0;
+    if (irValue < 18000) beatAvg = 0;
     }
   } else {
     beatAvg = 0;

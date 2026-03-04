@@ -1,119 +1,111 @@
 # Cortisol BLE Stress Monitor
 
-Flutter Android app for BLE-based physiological monitoring with on-device stress inference and a cortisol proxy trend.
+End to end IoT and mobile pipeline for BLE physiological sensing and on device stress inference.
 
-## What This App Does
-The app connects to an ESP32 peripheral, receives streamed sensor statistics over BLE, parses fragmented JSON packets, and shows:
-- live BPM, GSR, temperature
-- stress probability and stress level
-- cortisol proxy trend (derived from stress probability)
-- history table and CSV export
+This repository has two active parts:
+- `/Users/naderalmasri/Desktop/Project_IoT/cortisol_ble_app`: Flutter app that connects to ESP32 and runs inference locally.
+- `/Users/naderalmasri/Desktop/Project_IoT/training`: Python training and export pipeline for model artifacts used by the app.
 
-## Current Approach
-This project uses a two-stage ML strategy:
-1. Baseline model from WESAD (public dataset)
-2. Fine tuning/retraining with local app session data to reduce domain shift
+## Current System State
 
-Inference runs fully on device using exported logistic-regression parameters (`model_flutter.json`).
+The app is working and running on Android with live BLE ingestion.
 
-## Important Scientific Note
-`cortisol_proxy` is **not** biochemical cortisol concentration. It is a stress-derived trend score:
-- `cortisol_proxy = stress_probability * 100`
+Current deployed model path is nurse dataset driven Random Forest multiclass inference:
+- classes: `0 = low`, `1 = medium`, `2 = high`
+- app output: stress score, confidence, stress level, and a cortisol proxy trend
 
-## BLE Input Format
-Expected payloads contain:
-- `ts`
-- `BPM` map: `avg`, `min`, `max`, `std`
-- `GSR` map: `avg`, `min`, `max`, `std`
-- `Temp` map: `avg`, `min`, `max`, `std`
+Important: `cortisol_proxy` is not biochemical cortisol concentration. It is a scaled stress proxy for trend visualization.
 
-Example:
-```json
-{
-  "ts": 317521,
-  "BPM": {"avg": 74.2, "min": 57.0, "max": 83.0, "std": 7.83},
-  "GSR": {"avg": 2239.5, "min": 2224.0, "max": 2251.0, "std": 8.79},
-  "Temp": {"avg": 220.84, "min": 220.83, "max": 220.86, "std": 0.01}
-}
-```
+## BLE Data Flow
 
-## App Features
-- BLE scan/connect/disconnect/reconnect
-- fragmented stream parser for BLE JSON chunks
-- tabbed UI: `Connection`, `Dashboard`, `Raw`, `About`
-- expandable metric cards and trends
-- dedicated history page with table view
-- session labeling (`Rest`, `Stress`, `Recovery`, `Unlabeled`)
-- CSV logging of valid inference rows
-- copy-to-clipboard CSV export
+1. ESP32 notifies bytes over BLE characteristic `abcd1234-5678-1234-5678-abcdef123456`.
+2. Flutter decodes UTF8 chunks with `allowMalformed: true`.
+3. A brace matching stream assembler rebuilds complete JSON objects from fragmented and concatenated packets.
+4. Parsed objects update live metrics when keys exist (`ts`, `BPM`, `GSR`, `Temp`).
+5. Valid windows are passed to ML inference.
 
-## Stress Inference Rules
-Stress is computed only when all three are valid:
-- valid BPM
-- valid GSR
-- valid temperature
+Service Changed (`00002a05-0000-1000-8000-00805f9b34fb`) is explicitly avoided for data path selection.
 
-If one is missing/invalid, stress inference is skipped and the reason is shown.
+## Calibration and Personalization
 
-## Model Files Used In App
-Located in:
-`/Users/naderalmasri/Desktop/Project_IoT/cortisol_ble_app/assets/models`
+Calibration is now user specific and profile based:
+- calibration prompt appears only after BLE connection
+- user chooses a `userId`
+- baseline is stored per user in app documents as `user_calibration_<userId>.json`
+- calibration mode collects rest windows and persists baseline statistics
+- completion triggers a visible "Calibration complete" notification
 
-- `model_flutter.json` model/scaler parameters used by Flutter inference
-- `metrics.json` latest training metrics
-- `model_info.json` model/dataset metadata shown in About tab
+Inference is blocked if required signals are invalid.
 
-## Run The App
+## Confidence vs Probability
+
+UI now emphasizes confidence instead of raw probability wording.
+
+Confidence is computed from baseline relative sensor deltas and model certainty:
+- z bands are computed per sensor (HR, EDA, Temp) against personal baseline
+- sensor confidence bands are weighted `0.4 HR + 0.4 EDA + 0.2 Temp`
+- final confidence blends sensor and model confidence
+
+This makes confidence more physiologically interpretable for user specific behavior.
+
+## App Tabs
+
+Current top level tabs:
+- `Connection`
+- `Dashboard`
+- `About`
+
+Raw BLE stream moved into Developer Tools inside `About`.
+
+## Model Artifacts Used By App
+
+Location:
+- `/Users/naderalmasri/Desktop/Project_IoT/cortisol_ble_app/assets/models`
+
+Current files:
+- `nurse_rf_model.json`
+- `metrics.json`
+- `model_info.json`
+- `model_flutter.json` (legacy logistic artifact retained for compatibility)
+
+## Training and Evaluation Summary
+
+Primary nurse run metadata currently in assets:
+- rows: `12445`
+- features: `42`
+- best random grid params: `n_estimators=500`, `max_depth=20`, `min_samples_leaf=3`, `max_features=sqrt`
+- random split accuracy: `0.9675`
+- blocked split accuracy: `0.6389`
+- selected exported model mode: blocked
+
+Why both metrics exist:
+- random split is benchmark style and optimistic for lagged sequential windows
+- blocked split simulates realistic temporal generalization and is stricter
+
+## Quick Start
+
+### App
 ```bash
 cd /Users/naderalmasri/Desktop/Project_IoT/cortisol_ble_app
 flutter pub get
 flutter run -d SM_G960F
 ```
-Then use hot restart (`R`) after model updates.
 
-## Training Workflow
-Training assets are in:
-`/Users/naderalmasri/Desktop/Project_IoT/training`
-
-### One-command retrain (WESAD + local sessions)
+### Training
 ```bash
 cd /Users/naderalmasri/Desktop/Project_IoT/training
-make retrain-combined
-```
-
-This command:
-1. merges WESAD features + local session CSVs
-2. trains combined logistic model
-3. exports artifacts to `training/artifacts_combined`
-4. syncs model and metrics into app assets
-
-### Other useful commands
-```bash
 make help
-make prepare-wesad
-make train-wesad
-make train-combined
 ```
 
-## Local Session Data
-Local session CSV files are expected in:
-`/Users/naderalmasri/Desktop/Project_IoT/training/local_sessions`
+## Dataset References
 
-Schema:
-`time_iso,ts,bpm_avg,gsr_avg,temp_avg,stress_prob,cortisol_proxy,stress_level,label,ml_loaded`
+Nurse dataset paper used in current model documentation:
+- [Scientific Data paper (PMCID: PMC9159985)](https://pmc.ncbi.nlm.nih.gov/articles/PMC9159985/)
 
-## Dataset Reference
-Primary baseline dataset:
-- WESAD (Wearable Stress and Affect Detection)
-- UCI Repository, DOI: `10.24432/C57K5T`
+WESAD is still kept in the repo for baseline and experiments, but current app direction is nurse centered modeling and per user calibration.
 
-## Known Limitations
-- live BLE refresh stability still requires ongoing tuning depending on device conditions
-- model output quality depends heavily on real local labeled sessions
-- Local data is only for pipeline testing, not final model validation
+## Known Engineering Gaps
 
-## Next Steps
-1. collect more real labeled sessions
-2. retrain with higher real-data ratio
-3. calibrate thresholds and confidence display
-4. improve stream stability to remove periodic reconnect fallback
+- BLE live update path still needs additional hardening to remove reconnect like behavior in edge cases.
+- Model quality is sensitive to distribution drift across users and sessions.
+- Cortisol output remains a stress proxy, not a clinical cortisol assay.

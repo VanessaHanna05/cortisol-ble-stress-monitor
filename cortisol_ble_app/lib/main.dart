@@ -78,6 +78,7 @@ extension SessionLabelX on SessionLabel {
 
 class _BleHomeState extends State<BleHome> {
   final Guid knownCharUuid = Guid("abcd1234-5678-1234-5678-abcdef123456");
+  final Guid heartbeatCharUuid = Guid("abcd1234-5678-1234-5678-abcdef123457");
   final Guid? knownServiceUuid = null;
   static const String _serviceChangedUuid = "00002a0500001000800000805f9b34fb";
 
@@ -88,6 +89,7 @@ class _BleHomeState extends State<BleHome> {
   StreamSubscription<BluetoothConnectionState>? _connSub;
 
   BluetoothCharacteristic? _notifyChar;
+  BluetoothCharacteristic? _heartbeatChar;
   StreamSubscription<List<int>>? _notifySub;
   StreamSubscription<List<int>>? _notifySubAlt;
 
@@ -102,11 +104,13 @@ class _BleHomeState extends State<BleHome> {
   DateTime? _lastAutoReconnectAt;
   Timer? _notifyWatchdog;
   Timer? _autoReconnectTimer;
+  Timer? _heartbeatTimer;
+  int _heartbeatWriteFailures = 0;
 
   String _status = "Idle";
   String _parseStatus = "Waiting";
   String _raw = "";
-  String _deviceNameFilter = "ESP32_HealthMonitor";
+  String _deviceNameFilter = "";
   String? _lastError;
   late final TextEditingController _filterController;
 
@@ -122,6 +126,7 @@ class _BleHomeState extends State<BleHome> {
 
   final List<double> _bpmHistory = [];
   final List<double> _gsrHistory = [];
+  final List<double> _tempHistory = [];
   final List<double> _stressHistory = [];
   final List<HistoryEntry> _history = [];
   ScanResult? _lastConnectedScan;
@@ -131,14 +136,38 @@ class _BleHomeState extends State<BleHome> {
   File? _historyCsvFile;
   String? _historyCsvPath;
   int _loggedRows = 0;
+  File? _calibrationFile;
+  String? _lastCalibrationSignature;
+  String _activeUserId = "default";
+  late final TextEditingController _userIdController;
+  bool _guidedCalibrationActive = false;
+  bool _calibrationPromptShown = false;
+  bool _showDeveloperTools = false;
+  DateTime? _guidedCalibrationStartedAt;
+  Timer? _calibrationTicker;
+  static const Duration _minCalibrationDuration = Duration(minutes: 2);
+  bool _stressMeasureActive = false;
+  DateTime? _stressMeasureStartedAt;
+  Timer? _stressMeasureTicker;
+  final List<double> _measureScores = [];
+  final List<double> _measureConfidences = [];
+  int _measureValidSamples = 0;
+  int _measureInvalidSamples = 0;
+  String? _measureLiveIssue;
+  _MeasureSummary? _lastMeasureSummary;
+  int _calibrationInvalidSamples = 0;
+  static const Duration _measureDuration = Duration(seconds: 60);
+  static const int _measureMinValidSamples = 8;
 
   @override
   void initState() {
     super.initState();
     _filterController = TextEditingController(text: _deviceNameFilter);
+    _userIdController = TextEditingController(text: _activeUserId);
     _loadMlModel();
     _loadModelMetadata();
     _initHistoryLogging();
+    _initCalibrationStorage();
     _notifyWatchdog = Timer.periodic(const Duration(seconds: 3), (_) => _watchNotifyHealth());
     _autoReconnectTimer = Timer.periodic(const Duration(seconds: 10), (_) async {
       if (!mounted || !_connected || _connecting || _reconnecting || _resubscribing) return;
@@ -166,8 +195,183 @@ class _BleHomeState extends State<BleHome> {
     }
   }
 
+  Future<void> _initCalibrationStorage() async {
+    try {
+      await _switchCalibrationUser(_activeUserId, showToast: false);
+    } catch (e) {
+      _setError("Calibration load failed: $e");
+    }
+  }
+
+  Future<void> _switchCalibrationUser(String userId, {bool showToast = true}) async {
+    final cleaned = userId.trim().isEmpty ? "default" : userId.trim();
+    final dir = await getApplicationDocumentsDirectory();
+    final file = File("${dir.path}/user_calibration_$cleaned.json");
+    _calibrationFile = file;
+    _activeUserId = cleaned;
+    _userIdController.text = cleaned;
+    _lastCalibrationSignature = null;
+    _stressEngine.resetCalibration();
+    if (await file.exists()) {
+      final raw = await file.readAsString();
+      final map = json.decode(raw) as Map<String, dynamic>;
+      _stressEngine.loadCalibration(map);
+    }
+    if (mounted) {
+      setState(() {});
+    }
+    if (showToast) {
+      await _showToast("Active user: $cleaned");
+    }
+  }
+
+  void _maybePromptCalibration() {
+    if (!mounted || _calibrationPromptShown || !_connected) return;
+    if (_stressEngine.hasBaseline) return;
+    _calibrationPromptShown = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      if (!mounted) return;
+      await showDialog<void>(
+        context: context,
+        barrierDismissible: true,
+        builder: (ctx) {
+          return AlertDialog(
+            title: const Text("Please calibrate"),
+            content: const Text(
+              "For better personal accuracy, sit calmly for 2 to 5 minutes with minimal movement and normal breathing. Keep good sensor contact. Press Calibrate now to start.",
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.of(ctx).pop(),
+                child: const Text("Later"),
+              ),
+              FilledButton(
+                onPressed: () {
+                  Navigator.of(ctx).pop();
+                  unawaited(_startGuidedCalibrationWithUserPrompt());
+                },
+                child: const Text("Calibrate now"),
+              ),
+            ],
+          );
+        },
+      );
+    });
+  }
+
+  void _startGuidedCalibration() {
+    if (!_connected) {
+      unawaited(_showToast("Connect device before calibration"));
+      return;
+    }
+    if (!mounted) return;
+    setState(() {
+      _guidedCalibrationActive = true;
+      _sessionLabel = SessionLabel.rest;
+      _tabIndex = 1; // Dashboard
+      _guidedCalibrationStartedAt = DateTime.now();
+      _calibrationInvalidSamples = 0;
+    });
+    _stressEngine.setCalibrationMode(true);
+    _calibrationTicker?.cancel();
+    _calibrationTicker = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (!mounted || !_guidedCalibrationActive) return;
+      setState(() {});
+    });
+  }
+
+  Future<void> _startGuidedCalibrationWithUserPrompt() async {
+    final controller = TextEditingController(text: _activeUserId);
+    final selected = await showDialog<String>(
+      context: context,
+      barrierDismissible: true,
+      builder: (ctx) {
+        return AlertDialog(
+          title: const Text("Calibration user"),
+          content: TextField(
+            controller: controller,
+            decoration: const InputDecoration(
+              labelText: "User ID",
+              hintText: "example user_01",
+              border: OutlineInputBorder(),
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(ctx).pop(),
+              child: const Text("Cancel"),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.of(ctx).pop(controller.text.trim()),
+              child: const Text("Start"),
+            ),
+          ],
+        );
+      },
+    );
+    if (selected == null) return;
+    await _switchCalibrationUser(selected);
+    _startGuidedCalibration();
+  }
+
+  void _stopGuidedCalibration() {
+    _stressEngine.setCalibrationMode(false);
+    _calibrationTicker?.cancel();
+    _calibrationTicker = null;
+    if (!mounted) return;
+    setState(() {
+      _guidedCalibrationActive = false;
+      _guidedCalibrationStartedAt = null;
+    });
+  }
+
+  Future<void> _persistCalibrationIfNeeded() async {
+    final f = _calibrationFile;
+    if (f == null) return;
+    final payload = _stressEngine.exportCalibration();
+    if (payload == null) return;
+    final signature = json.encode(payload);
+    if (_lastCalibrationSignature == signature) return;
+    _lastCalibrationSignature = signature;
+    try {
+      await f.writeAsString(signature, mode: FileMode.write);
+    } catch (e) {
+      _setError("Calibration save failed: $e");
+    }
+  }
+
+  Future<void> _resetCalibration() async {
+    _stressEngine.resetCalibration();
+    _stressEngine.setCalibrationMode(false);
+    _lastCalibrationSignature = null;
+    final f = _calibrationFile;
+    try {
+      if (f != null && await f.exists()) {
+        await f.delete();
+      }
+    } catch (_) {}
+    if (!mounted) return;
+    setState(() {
+      _guidedCalibrationActive = false;
+      _guidedCalibrationStartedAt = null;
+      _calibrationInvalidSamples = 0;
+    });
+    await _showToast("Calibration reset");
+  }
+
   Future<void> _loadMlModel() async {
     try {
+      try {
+        final nurseRaw = await rootBundle.loadString('assets/models/nurse_rf_model.json');
+        final nurseJson = json.decode(nurseRaw) as Map<String, dynamic>;
+        _stressEngine.loadFlutterModel(nurseJson);
+        if (!mounted) return;
+        setState(() => _mlModelLoaded = true);
+        return;
+      } catch (_) {
+        // Fall back to previous logistic asset.
+      }
+
       final raw = await rootBundle.loadString('assets/models/model_flutter.json');
       final jsonMap = json.decode(raw) as Map<String, dynamic>;
       _stressEngine.loadFlutterModel(jsonMap);
@@ -202,9 +406,225 @@ class _BleHomeState extends State<BleHome> {
     _notifySubAlt?.cancel();
     _notifyWatchdog?.cancel();
     _autoReconnectTimer?.cancel();
+    _heartbeatTimer?.cancel();
+    _calibrationTicker?.cancel();
+    _stressMeasureTicker?.cancel();
     _device?.disconnect();
     _filterController.dispose();
+    _userIdController.dispose();
     super.dispose();
+  }
+
+  Duration get _guidedCalibrationElapsed {
+    final started = _guidedCalibrationStartedAt;
+    if (!_guidedCalibrationActive || started == null) return Duration.zero;
+    return DateTime.now().difference(started);
+  }
+
+  Duration get _guidedCalibrationRemaining {
+    final left = _minCalibrationDuration - _guidedCalibrationElapsed;
+    return left.isNegative ? Duration.zero : left;
+  }
+
+  bool get _guidedCalibrationTimeDone => _guidedCalibrationElapsed >= _minCalibrationDuration;
+  bool get _calibrationHasValidSignals =>
+      _isValidSignal((_bpm ?? const MetricGroup()).avg) &&
+      _isValidSignal((_gsr ?? const MetricGroup()).avg) &&
+      _isValidSignal(_temp);
+  Duration get _stressMeasureElapsed {
+    final started = _stressMeasureStartedAt;
+    if (!_stressMeasureActive || started == null) return Duration.zero;
+    return DateTime.now().difference(started);
+  }
+
+  Duration get _stressMeasureRemaining {
+    final left = _measureDuration - _stressMeasureElapsed;
+    return left.isNegative ? Duration.zero : left;
+  }
+
+  double get _stressMeasureProgress {
+    if (_measureDuration.inMilliseconds == 0) return 0;
+    return (_stressMeasureElapsed.inMilliseconds / _measureDuration.inMilliseconds).clamp(0.0, 1.0);
+  }
+
+  String? _plausibilityIssue({double? bpmAvg, double? gsrAvg, double? tempAvg}) {
+    if (!_isValidSignal(bpmAvg)) return "Heart rate not detected";
+    if (!_isValidSignal(gsrAvg)) return "GSR not detected";
+    if (!_isValidSignal(tempAvg)) return "Temperature not detected";
+    if (bpmAvg! < 45 || bpmAvg > 190) {
+      return "Heart rate out of range. Adjust finger sensor contact.";
+    }
+    if (tempAvg! < 20 || tempAvg > 45) {
+      return "Temperature out of range. Check skin contact.";
+    }
+    return null;
+  }
+
+  void _startStressMeasurement() {
+    if (!_connected) {
+      unawaited(_showToast("Connect device before measuring stress"));
+      return;
+    }
+    if (_stressMeasureActive) return;
+    setState(() {
+      _stressMeasureActive = true;
+      _stressMeasureStartedAt = DateTime.now();
+      _measureScores.clear();
+      _measureConfidences.clear();
+      _measureValidSamples = 0;
+      _measureInvalidSamples = 0;
+      _measureLiveIssue = null;
+    });
+    _stressMeasureTicker?.cancel();
+    _stressMeasureTicker = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (!mounted || !_stressMeasureActive) return;
+      if (_stressMeasureRemaining == Duration.zero) {
+        _finalizeStressMeasurement();
+        return;
+      }
+      setState(() {});
+    });
+  }
+
+  void _cancelStressMeasurement() {
+    _stressMeasureTicker?.cancel();
+    _stressMeasureTicker = null;
+    if (!mounted) return;
+    setState(() {
+      _stressMeasureActive = false;
+      _stressMeasureStartedAt = null;
+      _measureLiveIssue = "Measurement cancelled";
+    });
+  }
+
+  void _finalizeStressMeasurement() {
+    if (!_stressMeasureActive) return;
+    _stressMeasureTicker?.cancel();
+    _stressMeasureTicker = null;
+
+    final enough = _measureValidSamples >= _measureMinValidSamples && _measureScores.isNotEmpty;
+    _MeasureSummary? summary;
+    if (enough) {
+      final meanScore = _measureScores.reduce((a, b) => a + b) / _measureScores.length;
+      final meanConfidence = _measureConfidences.isEmpty
+          ? 0.0
+          : _measureConfidences.reduce((a, b) => a + b) / _measureConfidences.length;
+      final level = meanScore >= 0.67 ? "High" : (meanScore >= 0.34 ? "Medium" : "Low");
+      summary = _MeasureSummary(
+        score: meanScore,
+        confidence: meanConfidence,
+        level: level,
+        validSamples: _measureValidSamples,
+        invalidSamples: _measureInvalidSamples,
+      );
+    }
+
+    HistoryEntry? measuredEntry;
+    if (summary != null) {
+      measuredEntry = HistoryEntry(
+        when: DateTime.now(),
+        ts: _ts,
+        bpmAvg: _bpm?.avg,
+        gsrAvg: _gsr?.avg,
+        tempAvg: _temp,
+        stressProb: summary.score,
+        cortisolProxy: summary.score * 100.0,
+        stressLevel: summary.level,
+        label: _sessionLabel.value,
+      );
+    }
+
+    if (!mounted) return;
+    setState(() {
+      _stressMeasureActive = false;
+      _stressMeasureStartedAt = null;
+      _lastMeasureSummary = summary;
+      if (summary == null) {
+        _measureLiveIssue = "Not enough valid samples. Re-measure with better sensor contact.";
+      } else {
+        _measureLiveIssue = null;
+        _history.add(measuredEntry!);
+        if (_history.length > 300) _history.removeAt(0);
+      }
+    });
+    if (measuredEntry != null) {
+      unawaited(_appendHistoryLog(measuredEntry));
+    }
+    if (summary != null) {
+      unawaited(_sendStressResultToDevice(summary));
+    }
+
+    showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text("Stress measurement result"),
+        content: summary == null
+            ? Text("Measurement ended but valid samples were too low.\n\nValid: $_measureValidSamples\nInvalid: $_measureInvalidSamples")
+            : Text(
+                "Final stress level: ${summary.level}\n"
+                "Stress score: ${summary.score.toStringAsFixed(3)}\n"
+                "Confidence: ${(summary.confidence * 100).toStringAsFixed(0)}%\n"
+                "Cortisol proxy: ${(summary.score * 100).toStringAsFixed(1)}\n"
+                "Valid samples: ${summary.validSamples}\n"
+                "Invalid samples: ${summary.invalidSamples}",
+              ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(),
+            child: const Text("Close"),
+          ),
+        ],
+      ),
+    );
+  }
+
+  String _fmtDuration(Duration d) {
+    final total = d.inSeconds < 0 ? 0 : d.inSeconds;
+    final mm = (total ~/ 60).toString().padLeft(2, '0');
+    final ss = (total % 60).toString().padLeft(2, '0');
+    return "$mm:$ss";
+  }
+
+  String _fmtMinuteProgress(Duration elapsed, Duration target) {
+    final e = (elapsed.inSeconds / 60.0).clamp(0.0, 999.0);
+    final t = max(0.1, target.inSeconds / 60.0);
+    return "${e.toStringAsFixed(1)}/${t.toStringAsFixed(1)} min";
+  }
+
+  void _openStressDetailsPage() {
+    Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => _StressDetailsPage(
+          measuredSummary: _lastMeasureSummary,
+          stressResult: _stressResult,
+          stressInputIssue: _stressInputIssue,
+          mlModelLoaded: _mlModelLoaded,
+          calibrationReady: _stressEngine.calibrationReady,
+          calibrationSamples: _stressEngine.baselineCollected,
+          calibrationSampleMin: _stressEngine.baselineTarget,
+          calibrationElapsedText: _fmtMinuteProgress(_guidedCalibrationElapsed, _minCalibrationDuration),
+          calibrationRemainingText: _fmtDuration(_guidedCalibrationRemaining),
+          inferenceWindowText: "${_stressEngine.currentWindowSamples}/${_stressEngine.windowTarget}",
+          guidedCalibrationActive: _guidedCalibrationActive,
+        ),
+      ),
+    );
+  }
+
+  void _openGraphPage({
+    required String title,
+    required String unit,
+    required List<double> data,
+  }) {
+    Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => _GraphDetailPage(
+          title: title,
+          unit: unit,
+          data: List<double>.from(data),
+        ),
+      ),
+    );
   }
 
   Future<void> _watchNotifyHealth() async {
@@ -412,11 +832,22 @@ class _BleHomeState extends State<BleHome> {
   Future<void> _disconnect() async {
     final d = _device;
     if (d == null) return;
+    if (_stressMeasureActive) {
+      _cancelStressMeasurement();
+      unawaited(_showToast("Stress measurement stopped: device disconnected"));
+    }
+    if (_guidedCalibrationActive) {
+      _stopGuidedCalibration();
+      unawaited(_showToast("Calibration stopped: device disconnected"));
+    }
 
     await _notifySub?.cancel();
     await _notifySubAlt?.cancel();
     _notifySub = null;
     _notifySubAlt = null;
+    _heartbeatTimer?.cancel();
+    _heartbeatTimer = null;
+    _heartbeatChar = null;
 
     try {
       if (_notifyChar != null) {
@@ -439,6 +870,61 @@ class _BleHomeState extends State<BleHome> {
       _reconnecting = false;
       _isConnected = false;
       _status = "Disconnected";
+    });
+  }
+
+  Future<void> _resetSensorSession() async {
+    final hb = _heartbeatChar;
+    if (hb == null || !_connected) {
+      await _showToast("Reset unavailable. Connect first.");
+      return;
+    }
+    try {
+      await _writeHeartbeat("RESET");
+    } catch (_) {}
+    await _showToast("Reset command sent. Sensor should be reconnectable shortly.");
+    await _disconnect();
+  }
+
+  Future<void> _writeHeartbeat(String payload) async {
+    final hb = _heartbeatChar;
+    if (hb == null) return;
+    final bytes = utf8.encode(payload);
+    final preferNoResp = hb.properties.writeWithoutResponse;
+    final firstMode = preferNoResp;
+    try {
+      await hb.write(bytes, withoutResponse: firstMode);
+      _heartbeatWriteFailures = 0;
+      return;
+    } catch (_) {
+      // Retry once using the opposite write mode.
+    }
+    try {
+      await hb.write(bytes, withoutResponse: !firstMode);
+      _heartbeatWriteFailures = 0;
+    } catch (e) {
+      _heartbeatWriteFailures += 1;
+      if (_heartbeatWriteFailures >= 3) {
+        _setError("Heartbeat write failed repeatedly: $e");
+      }
+    }
+  }
+
+  Future<void> _sendStressResultToDevice(_MeasureSummary summary) async {
+    if (!_connected) return;
+    final safeLevel = summary.level.replaceAll("|", "/").trim();
+    final payload =
+        "RESULT|$safeLevel|${summary.score.toStringAsFixed(3)}|${summary.confidence.toStringAsFixed(3)}";
+    await _writeHeartbeat(payload);
+  }
+
+  void _startHeartbeat() {
+    _heartbeatTimer?.cancel();
+    _heartbeatTimer = Timer.periodic(const Duration(seconds: 5), (_) async {
+      if (!_connected || _connecting || _reconnecting) return;
+      final hb = _heartbeatChar;
+      if (hb == null) return;
+      await _writeHeartbeat("HB");
     });
   }
 
@@ -498,6 +984,9 @@ class _BleHomeState extends State<BleHome> {
     _notifySub = null;
     _notifySubAlt = null;
     _notifyChar = null;
+    _heartbeatChar = null;
+    _heartbeatTimer?.cancel();
+    _heartbeatTimer = null;
     await _connSub?.cancel();
     _connSub = null;
 
@@ -512,11 +1001,22 @@ class _BleHomeState extends State<BleHome> {
         _isConnected = s == BluetoothConnectionState.connected;
       });
       if (s == BluetoothConnectionState.disconnected) {
+        if (_stressMeasureActive) {
+          _cancelStressMeasurement();
+          unawaited(_showToast("Stress measurement stopped: device disconnected"));
+        }
+        if (_guidedCalibrationActive) {
+          _stopGuidedCalibration();
+          unawaited(_showToast("Calibration stopped: device disconnected"));
+        }
         _notifySub?.cancel();
         _notifySubAlt?.cancel();
         _notifySub = null;
         _notifySubAlt = null;
         _notifyChar = null;
+        _heartbeatChar = null;
+        _heartbeatTimer?.cancel();
+        _heartbeatTimer = null;
       }
     });
 
@@ -576,6 +1076,11 @@ class _BleHomeState extends State<BleHome> {
     }
 
     _notifyChar = target;
+    _heartbeatChar = _findHeartbeatCharacteristic(services);
+    _heartbeatWriteFailures = 0;
+    if (_heartbeatChar == null) {
+      _setError("Heartbeat characteristic not found. Remove old bond/app cache and reconnect.");
+    }
 
     final notifyOk = await _enableNotifyWithRetry(target);
     if (!notifyOk) {
@@ -591,6 +1096,8 @@ class _BleHomeState extends State<BleHome> {
     await _notifySubAlt?.cancel();
     _attachNotifyStreams(target);
     _lastNotifyAt = DateTime.now();
+    _startHeartbeat();
+    unawaited(_writeHeartbeat("HB"));
 
     // Optional initial read
     try {
@@ -608,6 +1115,17 @@ class _BleHomeState extends State<BleHome> {
       if (!silentReconnect) _status = "Connected";
       _parseStatus = "Listening";
     });
+    _maybePromptCalibration();
+  }
+
+  BluetoothCharacteristic? _findHeartbeatCharacteristic(List<BluetoothService> services) {
+    for (final s in services) {
+      for (final c in s.characteristics) {
+        if (_normGuid(c.uuid) != _normGuid(heartbeatCharUuid)) continue;
+        if (c.properties.write || c.properties.writeWithoutResponse) return c;
+      }
+    }
+    return null;
   }
 
   Future<List<BluetoothService>> _discoverServicesWithRetry(BluetoothDevice d) async {
@@ -688,7 +1206,7 @@ class _BleHomeState extends State<BleHome> {
 
   void _processJson(Map<String, dynamic> obj) {
     int? ts;
-    final tsRaw = obj["ts"] ?? obj["TS"];
+    final tsRaw = obj["ts"] ?? obj["TS"] ?? obj["t"];
     if (tsRaw is num) ts = tsRaw.toInt();
     if (tsRaw is String) ts = int.tryParse(tsRaw);
 
@@ -697,21 +1215,21 @@ class _BleHomeState extends State<BleHome> {
     MetricGroup? tempGroup;
     double? temp;
 
-    final bpmObj = obj["BPM"] ?? obj["bpm"];
+    final bpmObj = obj["BPM"] ?? obj["bpm"] ?? obj["b"];
     if (bpmObj is Map<String, dynamic>) {
       bpm = MetricGroup.fromMap(bpmObj);
     } else if (bpmObj is Map) {
       bpm = MetricGroup.fromMap(bpmObj.cast<String, dynamic>());
     }
 
-    final gsrObj = obj["GSR"] ?? obj["gsr"];
+    final gsrObj = obj["GSR"] ?? obj["gsr"] ?? obj["g"];
     if (gsrObj is Map<String, dynamic>) {
       gsr = MetricGroup.fromMap(gsrObj);
     } else if (gsrObj is Map) {
       gsr = MetricGroup.fromMap(gsrObj.cast<String, dynamic>());
     }
 
-    final tempObj = obj["Temp"] ?? obj["TEMP"] ?? obj["temp"] ?? obj["skinTemp"] ?? obj["temperature"];
+    final tempObj = obj["Temp"] ?? obj["TEMP"] ?? obj["temp"] ?? obj["skinTemp"] ?? obj["temperature"] ?? obj["tc"];
     if (tempObj is Map<String, dynamic>) {
       tempGroup = MetricGroup.fromMap(tempObj);
       temp = tempGroup.avg;
@@ -752,6 +1270,12 @@ class _BleHomeState extends State<BleHome> {
       stressIssue = "Stress requires valid GSR";
     } else if (!tempValid) {
       stressIssue = "Stress requires valid temperature";
+    } else {
+      stressIssue = _plausibilityIssue(
+        bpmAvg: bpmNow?.avg,
+        gsrAvg: gsrNow?.avg,
+        tempAvg: tempAvgNow,
+      );
     }
 
     StressInferenceResult? inference;
@@ -773,8 +1297,7 @@ class _BleHomeState extends State<BleHome> {
       );
     }
 
-    HistoryEntry? createdEntry;
-
+    bool finalizeMeasure = false;
     setState(() {
       _ts = ts ?? _ts;
       _bpm = bpm ?? _bpm;
@@ -785,19 +1308,6 @@ class _BleHomeState extends State<BleHome> {
         _stressResult = inference;
         _stressHistory.add(inference.stressProbability);
         if (_stressHistory.length > 60) _stressHistory.removeAt(0);
-        createdEntry = HistoryEntry(
-          when: DateTime.now(),
-          ts: _ts ?? tsVal,
-          bpmAvg: (_bpm ?? bpmNow)?.avg,
-          gsrAvg: (_gsr ?? gsrNow)?.avg,
-          tempAvg: _temp ?? tempAvgNow,
-          stressProb: inference.stressProbability,
-          cortisolProxy: inference.cortisolProxy,
-          stressLevel: inference.levelText,
-          label: _sessionLabel.value,
-        );
-        _history.add(createdEntry!);
-        if (_history.length > 300) _history.removeAt(0);
       } else if (stressIssue != null) {
         _stressResult = null;
       }
@@ -810,12 +1320,41 @@ class _BleHomeState extends State<BleHome> {
         _gsrHistory.add(gsr!.avg!);
         if (_gsrHistory.length > 30) _gsrHistory.removeAt(0);
       }
+      if (temp != null && temp.isFinite && temp > 0) {
+        _tempHistory.add(temp);
+        if (_tempHistory.length > 30) _tempHistory.removeAt(0);
+      }
+
+      if (_stressMeasureActive) {
+        if (inference != null && stressIssue == null) {
+          _measureScores.add(inference.stressProbability);
+          _measureConfidences.add(inference.confidence);
+          _measureValidSamples += 1;
+          _measureLiveIssue = null;
+        } else {
+          _measureInvalidSamples += 1;
+          _measureLiveIssue = stressIssue ?? "Waiting for enough window samples";
+        }
+        if (_stressMeasureRemaining == Duration.zero) {
+          finalizeMeasure = true;
+        }
+      }
+      if (_guidedCalibrationActive && stressIssue != null) {
+        _calibrationInvalidSamples += 1;
+      }
 
       _parseStatus = "OK";
     });
+    unawaited(_persistCalibrationIfNeeded());
 
-    if (createdEntry != null) {
-      unawaited(_appendHistoryLog(createdEntry!));
+    if (_guidedCalibrationActive &&
+        _stressEngine.baselineCollected >= _stressEngine.baselineTarget &&
+        _guidedCalibrationTimeDone) {
+      _stopGuidedCalibration();
+      unawaited(_showToast("Calibration complete"));
+    }
+    if (finalizeMeasure) {
+      _finalizeStressMeasurement();
     }
   }
 
@@ -823,26 +1362,6 @@ class _BleHomeState extends State<BleHome> {
     final list = _scanByDeviceId.values.toList();
     list.sort((a, b) => b.rssi.compareTo(a.rssi));
     return list;
-  }
-
-  void _clearLiveData() {
-    setState(() {
-      _raw = "";
-      _assembler.reset();
-      _bpm = null;
-      _gsr = null;
-      _temp = null;
-      _ts = null;
-      _stressResult = null;
-      _stressInputIssue = null;
-      _bpmHistory.clear();
-      _gsrHistory.clear();
-      _stressHistory.clear();
-      _history.clear();
-      _stressEngine.reset();
-      _parseStatus = "Cleared";
-    });
-    unawaited(_initHistoryLogging());
   }
 
   bool _isValidSignal(double? v) {
@@ -865,11 +1384,39 @@ class _BleHomeState extends State<BleHome> {
   }
 
   Widget _buildConnectionTab(String? connectedName) {
+    final strongest = _scanResultsSorted.isEmpty ? null : _scanResultsSorted.first.rssi;
     return RefreshIndicator(
       onRefresh: _startScan,
       child: ListView(
         padding: const EdgeInsets.all(16),
         children: [
+          Card(
+            child: Container(
+              padding: const EdgeInsets.all(14),
+              decoration: BoxDecoration(
+                borderRadius: BorderRadius.circular(12),
+                gradient: LinearGradient(
+                  colors: [
+                    Theme.of(context).colorScheme.primary.withValues(alpha: 0.20),
+                    Theme.of(context).colorScheme.tertiary.withValues(alpha: 0.14),
+                  ],
+                  begin: Alignment.topLeft,
+                  end: Alignment.bottomRight,
+                ),
+              ),
+              child: Wrap(
+                spacing: 8,
+                runSpacing: 8,
+                children: [
+                  _MiniPill(text: _connected ? "Connected" : "Disconnected"),
+                  _MiniPill(text: "Devices ${_scanResultsSorted.length}"),
+                  _MiniPill(text: "Best RSSI ${strongest ?? "N/A"}"),
+                  _MiniPill(text: "Parse $_parseStatus"),
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(height: 12),
           if (_lastError != null) ...[
             MaterialBanner(
               content: Text(_lastError!),
@@ -887,6 +1434,15 @@ class _BleHomeState extends State<BleHome> {
             scanning: _scanning,
             connecting: _connecting,
             connected: _connected,
+            canReconnectLast: !_connected && _lastConnectedScan != null && !_reconnecting,
+            onAutoFilterEsp32: () {
+              const target = "ESP32_HealthMonitor";
+              setState(() {
+                _deviceNameFilter = target;
+                _filterController.text = target;
+                _applyFilterToExistingResults();
+              });
+            },
             connectedName: connectedName,
             parseStatus: _parseStatus,
             mlModelLoaded: _mlModelLoaded,
@@ -901,6 +1457,7 @@ class _BleHomeState extends State<BleHome> {
             onStopScan: _stopScan,
             onDisconnect: _disconnect,
             onReconnect: _reconnect,
+            onResetSession: _resetSensorSession,
           ),
           const SizedBox(height: 12),
           _CardSection(
@@ -930,9 +1487,171 @@ class _BleHomeState extends State<BleHome> {
   }
 
   Widget _buildDashboardTab() {
+    final calibTimeProgress = (_guidedCalibrationElapsed.inMilliseconds / _minCalibrationDuration.inMilliseconds)
+        .clamp(0.0, 1.0);
+
     return ListView(
       padding: const EdgeInsets.all(16),
       children: [
+        Card(
+          child: Container(
+            padding: const EdgeInsets.all(14),
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(12),
+              gradient: LinearGradient(
+                colors: [
+                  Theme.of(context).colorScheme.secondary.withValues(alpha: 0.18),
+                  Theme.of(context).colorScheme.primary.withValues(alpha: 0.10),
+                ],
+                begin: Alignment.topLeft,
+                end: Alignment.bottomRight,
+              ),
+            ),
+            child: Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                _MiniPill(text: _connected ? "Live connected" : "Offline"),
+                _MiniPill(text: "ML ${_mlModelLoaded ? "ON" : "OFF"}"),
+                _MiniPill(text: "Parse $_parseStatus"),
+                _MiniPill(text: _stressResult?.levelText ?? "Stress N/A"),
+                _MiniPill(text: _stressEngine.calibrationReady ? "Calibrated" : "Uncalibrated"),
+              ],
+            ),
+          ),
+        ),
+        const SizedBox(height: 12),
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.all(14),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text("Measure stress", style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
+                const SizedBox(height: 6),
+                Text(
+                  _stressMeasureActive
+                      ? "Measuring now. Keep good sensor contact and stay still."
+                      : "Press Measure stress to run a timed measurement and get a final output.",
+                ),
+                const SizedBox(height: 10),
+                if (_stressMeasureActive) ...[
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      Text("Time left ${_fmtDuration(_stressMeasureRemaining)}"),
+                      Text(_fmtDuration(_stressMeasureElapsed)),
+                    ],
+                  ),
+                  const SizedBox(height: 6),
+                  LinearProgressIndicator(value: _stressMeasureProgress),
+                  const SizedBox(height: 10),
+                  Wrap(
+                    spacing: 8,
+                    runSpacing: 8,
+                    children: [
+                      _MiniPill(text: "Valid $_measureValidSamples"),
+                      _MiniPill(text: "Invalid $_measureInvalidSamples"),
+                      _MiniPill(text: "Min valid $_measureMinValidSamples"),
+                    ],
+                  ),
+                ],
+                if (_measureLiveIssue != null) ...[
+                  const SizedBox(height: 8),
+                  Text(
+                    _measureLiveIssue!,
+                    style: TextStyle(color: Theme.of(context).colorScheme.error),
+                  ),
+                ],
+                if (_lastMeasureSummary != null && !_stressMeasureActive) ...[
+                  const SizedBox(height: 8),
+                  Wrap(
+                    spacing: 8,
+                    runSpacing: 8,
+                    children: [
+                      _MiniPill(text: "Last ${_lastMeasureSummary!.level}"),
+                      _MiniPill(text: "Score ${_lastMeasureSummary!.score.toStringAsFixed(3)}"),
+                      _MiniPill(text: "Conf ${(100 * _lastMeasureSummary!.confidence).toStringAsFixed(0)}%"),
+                    ],
+                  ),
+                ],
+                const SizedBox(height: 10),
+                Wrap(
+                  spacing: 10,
+                  runSpacing: 10,
+                  children: [
+                    FilledButton.icon(
+                      onPressed: (_stressMeasureActive || !_connected) ? null : _startStressMeasurement,
+                      icon: const Icon(Icons.play_arrow),
+                      label: const Text("Measure stress"),
+                    ),
+                    OutlinedButton.icon(
+                      onPressed: _stressMeasureActive ? _cancelStressMeasurement : null,
+                      icon: const Icon(Icons.stop),
+                      label: const Text("Cancel"),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+        ),
+        const SizedBox(height: 12),
+        if (_guidedCalibrationActive)
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(14),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text("Calibration in progress", style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
+                  const SizedBox(height: 8),
+                  Text("User $_activeUserId"),
+                  const SizedBox(height: 6),
+                  Row(
+                    children: [
+                      Icon(
+                        _calibrationHasValidSignals ? Icons.check_circle : Icons.sensors_off,
+                        size: 16,
+                        color: _calibrationHasValidSignals ? Colors.greenAccent : Colors.orangeAccent,
+                      ),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: Text(
+                          _calibrationHasValidSignals
+                              ? "Valid signals detected. Collecting windows."
+                              : "Waiting for valid HR, GSR, and Temp values above 0.",
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 10),
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      Text("Time left ${_fmtDuration(_guidedCalibrationRemaining)}"),
+                      Text("${_fmtDuration(_guidedCalibrationElapsed)} / ${_fmtDuration(_minCalibrationDuration)}"),
+                    ],
+                  ),
+                  const SizedBox(height: 6),
+                  LinearProgressIndicator(value: calibTimeProgress),
+                  const SizedBox(height: 10),
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      const Text("Valid samples collected"),
+                      Text(
+                        "${_stressEngine.baselineCollected} (min ${_stressEngine.baselineTarget})",
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 6),
+                  Text("Invalid ignored $_calibrationInvalidSamples"),
+                ],
+              ),
+            ),
+          ),
+        if (_guidedCalibrationActive) const SizedBox(height: 12),
         _MetricsGrid(
           ts: _ts,
           bpm: _bpm,
@@ -940,6 +1659,8 @@ class _BleHomeState extends State<BleHome> {
           temp: _temp,
           stressResult: _stressResult,
           stressInputIssue: _stressInputIssue,
+          measuredSummary: _lastMeasureSummary,
+          stressMeasureActive: _stressMeasureActive,
           mlModelLoaded: _mlModelLoaded,
           calibrationWindows: _stressEngine.baselineCollected,
           calibrationTarget: _stressEngine.baselineTarget,
@@ -948,104 +1669,17 @@ class _BleHomeState extends State<BleHome> {
           calibrationReady: _stressEngine.calibrationReady,
           bpmHistory: _bpmHistory,
           gsrHistory: _gsrHistory,
+          tempHistory: _tempHistory,
           stressHistory: _stressHistory,
-        ),
-        const SizedBox(height: 12),
-        _CardSection(
-          title: "History summary",
-          subtitle: "Recent rolling windows from live session.",
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text("Session label", style: TextStyle(color: Colors.white.withValues(alpha: 0.8))),
-              const SizedBox(height: 8),
-              SegmentedButton<SessionLabel>(
-                segments: const [
-                  ButtonSegment(value: SessionLabel.unlabeled, label: Text("Unlabeled")),
-                  ButtonSegment(value: SessionLabel.rest, label: Text("Rest")),
-                  ButtonSegment(value: SessionLabel.stressTask, label: Text("Stress")),
-                  ButtonSegment(value: SessionLabel.recovery, label: Text("Recovery")),
-                ],
-                selected: {_sessionLabel},
-                onSelectionChanged: (set) {
-                  if (set.isEmpty) return;
-                  setState(() => _sessionLabel = set.first);
-                },
-              ),
-              const SizedBox(height: 10),
-              Wrap(
-                spacing: 8,
-                runSpacing: 8,
-                children: [
-                  _MiniPill(text: "Label ${_sessionLabel.title}"),
-                  _MiniPill(text: "CSV rows $_loggedRows"),
-                  _MiniPill(text: "BPM samples ${_bpmHistory.length}"),
-                  _MiniPill(text: "GSR samples ${_gsrHistory.length}"),
-                  _MiniPill(text: "Stress samples ${_stressHistory.length}"),
-                  _MiniPill(text: _stressHistory.isEmpty ? "Stress avg N/A" : "Stress avg ${(100 * (_stressHistory.reduce((a, b) => a + b) / _stressHistory.length)).toStringAsFixed(1)}%"),
-                ],
-              ),
-              const SizedBox(height: 10),
-              FilledButton.icon(
-                onPressed: _openHistoryPage,
-                icon: const Icon(Icons.table_chart),
-                label: const Text("View history"),
-              ),
-            ],
-          ),
-        ),
-        const SizedBox(height: 24),
-      ],
-    );
-  }
-
-  Widget _buildRawTab() {
-    return ListView(
-      padding: const EdgeInsets.all(16),
-      children: [
-        Card(
-          child: Padding(
-            padding: const EdgeInsets.all(14),
-            child: Wrap(
-              spacing: 10,
-              runSpacing: 10,
-              children: [
-                FilledButton.icon(
-                  onPressed: () async {
-                    await Clipboard.setData(ClipboardData(text: _raw));
-                    if (!mounted) return;
-                    await _showToast("Copied raw to clipboard");
-                  },
-                  icon: const Icon(Icons.copy),
-                  label: const Text("Copy raw"),
-                ),
-                OutlinedButton.icon(
-                  onPressed: _clearLiveData,
-                  icon: const Icon(Icons.delete_outline),
-                  label: const Text("Clear all data"),
-                ),
-                _MiniPill(text: "Buffer: ${_assembler.pendingBytes}"),
-                _MiniPill(text: "Parse: $_parseStatus"),
-              ],
-            ),
-          ),
-        ),
-        const SizedBox(height: 12),
-        _CardSection(
-          title: "Raw BLE stream",
-          subtitle: "Latest payload text for debugging parser and packet boundaries.",
-          child: Container(
-            padding: const EdgeInsets.all(12),
-            decoration: BoxDecoration(
-              color: Colors.black.withValues(alpha: 0.25),
-              borderRadius: BorderRadius.circular(12),
-              border: Border.all(color: Colors.white.withValues(alpha: 0.08)),
-            ),
-            child: SelectableText(
-              _raw.isEmpty ? "(empty)" : _raw,
-              style: const TextStyle(fontFamily: "monospace", fontSize: 12),
-            ),
-          ),
+          guidedCalibrationActive: _guidedCalibrationActive,
+          calibrationElapsedText: _fmtDuration(_guidedCalibrationElapsed),
+          calibrationRemainingText: _fmtDuration(_guidedCalibrationRemaining),
+          calibrationTimeDone: _guidedCalibrationTimeDone,
+          calibrationElapsedMinuteText: _fmtMinuteProgress(_guidedCalibrationElapsed, _minCalibrationDuration),
+          onOpenStressDetails: _openStressDetailsPage,
+          onOpenBpmGraph: () => _openGraphPage(title: "BPM Trend", unit: "bpm", data: _bpmHistory),
+          onOpenGsrGraph: () => _openGraphPage(title: "GSR Trend", unit: "uS", data: _gsrHistory),
+          onOpenStressGraph: () => _openGraphPage(title: "Stress Score Trend", unit: "score", data: _stressHistory),
         ),
         const SizedBox(height: 24),
       ],
@@ -1054,9 +1688,18 @@ class _BleHomeState extends State<BleHome> {
 
   Widget _buildAboutTab() {
     String s(dynamic v) => v == null ? "N/A" : v.toString();
-    final accuracy = _modelMetrics["accuracy"];
-    final f1 = _modelMetrics["f1"];
-    final auc = _modelMetrics["roc_auc"];
+    final random = (_modelMetrics["random_split_metrics"] is Map<String, dynamic>)
+        ? (_modelMetrics["random_split_metrics"] as Map<String, dynamic>)
+        : const <String, dynamic>{};
+    final blocked = (_modelMetrics["blocked_split_metrics"] is Map<String, dynamic>)
+        ? (_modelMetrics["blocked_split_metrics"] as Map<String, dynamic>)
+        : const <String, dynamic>{};
+    final legacyAccuracy = _modelMetrics["accuracy"];
+    final legacyF1 = _modelMetrics["f1"];
+    final randomAccuracy = random["accuracy"] ?? legacyAccuracy;
+    final randomF1 = random["f1_macro"] ?? legacyF1;
+    final blockedAccuracy = blocked["accuracy"];
+    final blockedF1 = blocked["f1_macro"];
     return ListView(
       padding: const EdgeInsets.all(16),
       children: [
@@ -1086,11 +1729,70 @@ class _BleHomeState extends State<BleHome> {
               Text("Name: ${s(_modelInfo["dataset_name"])}"),
               Text("Source: ${s(_modelInfo["dataset_source"])}"),
               Text("DOI: ${s(_modelInfo["dataset_doi"])}"),
+              Text("PMID: ${s(_modelInfo["dataset_pmid"])}"),
+              Text("PMCID: ${s(_modelInfo["dataset_pmcid"])}"),
+              Text("Repository: ${s(_modelInfo["dataset_repository"])}"),
+              Text("Repository DOI: ${s(_modelInfo["dataset_repository_doi"])}"),
               Text("Version: ${s(_modelInfo["dataset_version"])}"),
               Text("Dataset date: ${s(_modelInfo["dataset_date"])}"),
               Text("Last update: ${s(_modelInfo["dataset_last_update"])}"),
               Text("Subjects: ${s(_modelInfo["dataset_subjects"])}"),
               Text("Instances: ${s(_modelInfo["dataset_instances"])}"),
+              Text("Collection period: ${s(_modelInfo["dataset_collection_period"])}"),
+              Text("Total hours: ${s(_modelInfo["dataset_total_hours"])}"),
+              Text("Modalities: ${s(_modelInfo["dataset_modalities"])}"),
+            ],
+          ),
+        ),
+        const SizedBox(height: 12),
+        _CardSection(
+          title: "Calibration",
+          subtitle: "Personal baseline for your own physiology",
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                "How to calibrate: sit calmly for 2 to 5 minutes, normal breathing, minimal movement, good sensor contact.",
+              ),
+              const SizedBox(height: 6),
+              const Text("Calibration windows are collected only when HR, GSR, and Temp are valid values above 0."),
+              const SizedBox(height: 8),
+              Wrap(
+                spacing: 8,
+                runSpacing: 8,
+                children: [
+                  _MiniPill(text: "Status ${_stressEngine.calibrationReady ? "Ready" : "Not ready"}"),
+                  _MiniPill(text: "Valid samples ${_stressEngine.baselineCollected} (min ${_stressEngine.baselineTarget})"),
+                  _MiniPill(text: "Invalid ignored $_calibrationInvalidSamples"),
+                  _MiniPill(text: "Time ${_fmtMinuteProgress(_guidedCalibrationElapsed, _minCalibrationDuration)}"),
+                  _MiniPill(text: "Time left ${_fmtDuration(_guidedCalibrationRemaining)}"),
+                  _MiniPill(text: "Mode ${_guidedCalibrationActive ? "Calibrating" : "Idle"}"),
+                  _MiniPill(text: "User $_activeUserId"),
+                  _MiniPill(text: _connected ? "Device connected" : "Connect device to calibrate"),
+                ],
+              ),
+              const SizedBox(height: 10),
+              Wrap(
+                spacing: 10,
+                runSpacing: 10,
+                children: [
+                  FilledButton.icon(
+                    onPressed: (_guidedCalibrationActive || !_connected) ? null : _startGuidedCalibrationWithUserPrompt,
+                    icon: const Icon(Icons.play_arrow),
+                    label: const Text("Calibrate now"),
+                  ),
+                  OutlinedButton.icon(
+                    onPressed: _guidedCalibrationActive ? _stopGuidedCalibration : null,
+                    icon: const Icon(Icons.stop),
+                    label: const Text("Stop"),
+                  ),
+                  OutlinedButton.icon(
+                    onPressed: _resetCalibration,
+                    icon: const Icon(Icons.tune),
+                    label: const Text("Reset baseline"),
+                  ),
+                ],
+              ),
             ],
           ),
         ),
@@ -1102,12 +1804,120 @@ class _BleHomeState extends State<BleHome> {
             spacing: 8,
             runSpacing: 8,
             children: [
-              _MiniPill(text: "Accuracy ${accuracy == null ? "N/A" : (accuracy as num).toStringAsFixed(3)}"),
-              _MiniPill(text: "F1 ${f1 == null ? "N/A" : (f1 as num).toStringAsFixed(3)}"),
-              _MiniPill(text: "AUC ${auc == null ? "N/A" : (auc as num).toStringAsFixed(3)}"),
+              _MiniPill(text: "Random acc ${randomAccuracy == null ? "N/A" : (randomAccuracy as num).toStringAsFixed(3)}"),
+              _MiniPill(text: "Random F1 ${randomF1 == null ? "N/A" : (randomF1 as num).toStringAsFixed(3)}"),
+              _MiniPill(text: "Blocked acc ${blockedAccuracy == null ? "N/A" : (blockedAccuracy as num).toStringAsFixed(3)}"),
+              _MiniPill(text: "Blocked F1 ${blockedF1 == null ? "N/A" : (blockedF1 as num).toStringAsFixed(3)}"),
               _MiniPill(text: "Rows ${s(_modelMetrics["rows_total"])}"),
-              _MiniPill(text: "Train ${s(_modelMetrics["rows_train"])}"),
-              _MiniPill(text: "Test ${s(_modelMetrics["rows_test"])}"),
+              _MiniPill(text: "CV best F1w ${_modelMetrics["cv_best_score_f1_weighted"] == null ? "N/A" : ((_modelMetrics["cv_best_score_f1_weighted"] as num).toStringAsFixed(3))}"),
+              _MiniPill(text: "Selected ${s(_modelMetrics["selected_model"])}"),
+            ],
+          ),
+        ),
+        const SizedBox(height: 12),
+        _CardSection(
+          title: "Developer",
+          subtitle: "Data collection and labeling for fine tuning",
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              OutlinedButton.icon(
+                onPressed: () => setState(() => _showDeveloperTools = !_showDeveloperTools),
+                icon: const Icon(Icons.developer_mode),
+                label: Text(_showDeveloperTools ? "Hide developer tools" : "I am a developer"),
+              ),
+              if (_showDeveloperTools) ...[
+                const SizedBox(height: 10),
+                TextField(
+                  controller: _userIdController,
+                  decoration: const InputDecoration(
+                    labelText: "Developer user ID",
+                    border: OutlineInputBorder(),
+                  ),
+                ),
+                const SizedBox(height: 8),
+                Wrap(
+                  spacing: 10,
+                  runSpacing: 10,
+                  children: [
+                    FilledButton.icon(
+                      onPressed: () => _switchCalibrationUser(_userIdController.text),
+                      icon: const Icon(Icons.person),
+                      label: const Text("Load user profile"),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 10),
+                Text("Session label", style: TextStyle(color: Colors.white.withValues(alpha: 0.8))),
+                const SizedBox(height: 8),
+                SegmentedButton<SessionLabel>(
+                  segments: const [
+                    ButtonSegment(value: SessionLabel.unlabeled, label: Text("Unlabeled")),
+                    ButtonSegment(value: SessionLabel.rest, label: Text("Rest")),
+                    ButtonSegment(value: SessionLabel.stressTask, label: Text("Stress")),
+                    ButtonSegment(value: SessionLabel.recovery, label: Text("Recovery")),
+                  ],
+                  selected: {_sessionLabel},
+                  onSelectionChanged: (set) {
+                    if (set.isEmpty) return;
+                    setState(() => _sessionLabel = set.first);
+                  },
+                ),
+                const SizedBox(height: 10),
+                Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: [
+                    _MiniPill(text: "Label ${_sessionLabel.title}"),
+                    _MiniPill(text: "CSV rows $_loggedRows"),
+                    _MiniPill(text: "Path ${_historyCsvPath ?? "N/A"}"),
+                    _MiniPill(text: "Raw bytes ${_raw.length}"),
+                  ],
+                ),
+                const SizedBox(height: 10),
+                Wrap(
+                  spacing: 10,
+                  runSpacing: 10,
+                  children: [
+                    FilledButton.icon(
+                      onPressed: _openHistoryPage,
+                      icon: const Icon(Icons.table_chart),
+                      label: const Text("View history"),
+                    ),
+                    OutlinedButton.icon(
+                      onPressed: _copyHistoryCsvToClipboard,
+                      icon: const Icon(Icons.copy),
+                      label: const Text("Copy CSV"),
+                    ),
+                    OutlinedButton.icon(
+                      onPressed: () async {
+                        await Clipboard.setData(ClipboardData(text: _raw));
+                        if (!mounted) return;
+                        await _showToast("Copied raw to clipboard");
+                      },
+                      icon: const Icon(Icons.code),
+                      label: const Text("Copy raw"),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 10),
+                _CardSection(
+                  title: "Raw BLE stream",
+                  subtitle: "Developer debug view",
+                  child: Container(
+                    padding: const EdgeInsets.all(12),
+                    decoration: BoxDecoration(
+                      color: Colors.black.withValues(alpha: 0.25),
+                      borderRadius: BorderRadius.circular(12),
+                      border: Border.all(color: Colors.white.withValues(alpha: 0.08)),
+                    ),
+                    child: SelectableText(
+                      _raw.isEmpty ? "(empty)" : _raw,
+                      style: const TextStyle(fontFamily: "monospace", fontSize: 12),
+                    ),
+                  ),
+                ),
+              ],
             ],
           ),
         ),
@@ -1121,7 +1931,7 @@ class _BleHomeState extends State<BleHome> {
     final connectedName = _device?.platformName.isNotEmpty == true
         ? _device!.platformName
         : _device?.remoteId.str;
-    final tabTitles = ["Connection", "Dashboard", "Raw debug", "About"];
+    final tabTitles = ["Connection", "Dashboard", "About"];
 
     return Scaffold(
       appBar: AppBar(
@@ -1135,7 +1945,7 @@ class _BleHomeState extends State<BleHome> {
           ? FloatingActionButton.extended(
               onPressed: _reconnecting ? null : _reconnect,
               icon: const Icon(Icons.refresh),
-              label: Text(_reconnecting ? "Reconnecting" : "Reconnect"),
+              label: Text(_reconnecting ? "Refreshing" : "Refresh"),
             )
           : null,
       body: IndexedStack(
@@ -1143,7 +1953,6 @@ class _BleHomeState extends State<BleHome> {
         children: [
           _buildConnectionTab(connectedName),
           _buildDashboardTab(),
-          _buildRawTab(),
           _buildAboutTab(),
         ],
       ),
@@ -1153,7 +1962,6 @@ class _BleHomeState extends State<BleHome> {
         destinations: const [
           NavigationDestination(icon: Icon(Icons.bluetooth_searching), label: "Connection"),
           NavigationDestination(icon: Icon(Icons.monitor_heart), label: "Dashboard"),
-          NavigationDestination(icon: Icon(Icons.code), label: "Raw"),
           NavigationDestination(icon: Icon(Icons.info_outline), label: "About"),
         ],
       ),
@@ -1177,10 +1985,10 @@ class MetricGroup {
 
   factory MetricGroup.fromMap(Map<String, dynamic> m) {
     return MetricGroup(
-      avg: _toDouble(m["avg"]),
-      min: _toDouble(m["min"]),
-      max: _toDouble(m["max"]),
-      std: _toDouble(m["std"]),
+      avg: _toDouble(m["avg"] ?? m["a"]),
+      min: _toDouble(m["min"] ?? m["m"]),
+      max: _toDouble(m["max"] ?? m["x"]),
+      std: _toDouble(m["std"] ?? m["s"]),
     );
   }
 }
@@ -1294,29 +2102,35 @@ class _TopActions extends StatelessWidget {
   final bool scanning;
   final bool connecting;
   final bool connected;
+  final bool canReconnectLast;
   final String? connectedName;
   final String parseStatus;
   final bool mlModelLoaded;
   final TextEditingController filterController;
   final ValueChanged<String> onFilterChanged;
+  final VoidCallback onAutoFilterEsp32;
   final VoidCallback onScan;
   final VoidCallback onStopScan;
   final VoidCallback onDisconnect;
   final VoidCallback onReconnect;
+  final VoidCallback onResetSession;
 
   const _TopActions({
     required this.scanning,
     required this.connecting,
     required this.connected,
+    required this.canReconnectLast,
     required this.connectedName,
     required this.parseStatus,
     required this.mlModelLoaded,
     required this.filterController,
     required this.onFilterChanged,
+    required this.onAutoFilterEsp32,
     required this.onScan,
     required this.onStopScan,
     required this.onDisconnect,
     required this.onReconnect,
+    required this.onResetSession,
   });
 
   @override
@@ -1355,6 +2169,18 @@ class _TopActions extends StatelessWidget {
                     icon: const Icon(Icons.refresh),
                     label: const Text("Reconnect"),
                   ),
+                if (canReconnectLast)
+                  FilledButton.tonalIcon(
+                    onPressed: onReconnect,
+                    icon: const Icon(Icons.history_toggle_off),
+                    label: const Text("Reconnect last"),
+                  ),
+                if (connected)
+                  OutlinedButton.icon(
+                    onPressed: onResetSession,
+                    icon: const Icon(Icons.restart_alt),
+                    label: const Text("Reset sensor session"),
+                  ),
               ],
             ),
             const SizedBox(height: 12),
@@ -1366,6 +2192,18 @@ class _TopActions extends StatelessWidget {
                 border: OutlineInputBorder(),
               ),
               onChanged: onFilterChanged,
+            ),
+            const SizedBox(height: 8),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                OutlinedButton.icon(
+                  onPressed: onAutoFilterEsp32,
+                  icon: const Icon(Icons.filter_alt),
+                  label: const Text("Auto filter ESP32"),
+                ),
+              ],
             ),
             const SizedBox(height: 12),
             Container(
@@ -1417,6 +2255,8 @@ class _MetricsGrid extends StatelessWidget {
   final double? temp;
   final StressInferenceResult? stressResult;
   final String? stressInputIssue;
+  final _MeasureSummary? measuredSummary;
+  final bool stressMeasureActive;
   final bool mlModelLoaded;
   final int calibrationWindows;
   final int calibrationTarget;
@@ -1425,7 +2265,17 @@ class _MetricsGrid extends StatelessWidget {
   final bool calibrationReady;
   final List<double> bpmHistory;
   final List<double> gsrHistory;
+  final List<double> tempHistory;
   final List<double> stressHistory;
+  final bool guidedCalibrationActive;
+  final String calibrationElapsedText;
+  final String calibrationRemainingText;
+  final bool calibrationTimeDone;
+  final String calibrationElapsedMinuteText;
+  final VoidCallback onOpenStressDetails;
+  final VoidCallback onOpenBpmGraph;
+  final VoidCallback onOpenGsrGraph;
+  final VoidCallback onOpenStressGraph;
 
   const _MetricsGrid({
     required this.ts,
@@ -1434,6 +2284,8 @@ class _MetricsGrid extends StatelessWidget {
     required this.temp,
     required this.stressResult,
     required this.stressInputIssue,
+    required this.measuredSummary,
+    required this.stressMeasureActive,
     required this.mlModelLoaded,
     required this.calibrationWindows,
     required this.calibrationTarget,
@@ -1442,14 +2294,29 @@ class _MetricsGrid extends StatelessWidget {
     required this.calibrationReady,
     required this.bpmHistory,
     required this.gsrHistory,
+    required this.tempHistory,
     required this.stressHistory,
+    required this.guidedCalibrationActive,
+    required this.calibrationElapsedText,
+    required this.calibrationRemainingText,
+    required this.calibrationTimeDone,
+    required this.calibrationElapsedMinuteText,
+    required this.onOpenStressDetails,
+    required this.onOpenBpmGraph,
+    required this.onOpenGsrGraph,
+    required this.onOpenStressGraph,
   });
 
   @override
   Widget build(BuildContext context) {
-    final stressText = stressResult?.levelText ?? "N/A";
-    final stressProb = stressResult == null ? "N/A" : "${(stressResult!.stressProbability * 100).toStringAsFixed(0)}%";
-    final proxyText = stressResult == null ? "N/A" : stressResult!.cortisolProxy.toStringAsFixed(1);
+    final stressText = stressMeasureActive ? "Measuring..." : (measuredSummary?.level ?? "Not measured");
+    final confidenceCombined = measuredSummary == null
+        ? "N/A"
+        : "${(measuredSummary!.confidence * 100).toStringAsFixed(0)}% "
+            "(${measuredSummary!.confidence >= 0.75 ? "High" : (measuredSummary!.confidence >= 0.45 ? "Medium" : "Low")})";
+    final bpmAvgDisplay = _fmt(bpm?.avg);
+    final gsrAvgDisplay = _fmt(gsr?.avg);
+    final tempAvgDisplay = _fmt(temp);
 
     return Card(
       child: Padding(
@@ -1457,7 +2324,9 @@ class _MetricsGrid extends StatelessWidget {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            const Text("Live metrics", style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
+            const Text("Live averages", style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
+            const SizedBox(height: 4),
+            const Text("Simple view for BPM, GSR, and temperature"),
             const SizedBox(height: 10),
             Wrap(
               spacing: 10,
@@ -1467,39 +2336,25 @@ class _MetricsGrid extends StatelessWidget {
                   title: "BPM",
                   icon: Icons.favorite,
                   accent: const Color(0xFFE11D48),
-                  primaryValue: _fmt(bpm?.avg),
-                  primaryUnit: "bpm avg",
-                  details: [
-                    ("Min", _fmt(bpm?.min)),
-                    ("Max", _fmt(bpm?.max)),
-                    ("Std", _fmt(bpm?.std)),
-                    ("Last ts", ts?.toString() ?? "N/A"),
-                  ],
+                  primaryValue: bpmAvgDisplay,
+                  primaryUnit: "Average BPM",
+                  details: const [],
                 ),
                 _ExpandableMetricCard(
                   title: "GSR",
                   icon: Icons.waves,
                   accent: const Color(0xFF14B8A6),
-                  primaryValue: _fmt(gsr?.avg),
-                  primaryUnit: "avg",
-                  details: [
-                    ("Min", _fmt(gsr?.min)),
-                    ("Max", _fmt(gsr?.max)),
-                    ("Std", _fmt(gsr?.std)),
-                    ("Samples", gsrHistory.length.toString()),
-                  ],
+                  primaryValue: gsrAvgDisplay,
+                  primaryUnit: "Average GSR",
+                  details: const [],
                 ),
                 _ExpandableMetricCard(
                   title: "Temperature",
                   icon: Icons.thermostat,
                   accent: const Color(0xFFF59E0B),
-                  primaryValue: _fmt(temp),
-                  primaryUnit: "deg C",
-                  details: [
-                    ("Raw ts", ts?.toString() ?? "N/A"),
-                    ("Calib", calibrationReady ? "ready" : "$calibrationWindows/$calibrationTarget"),
-                    ("Window", "$windowSamples/$windowTarget"),
-                  ],
+                  primaryValue: tempAvgDisplay,
+                  primaryUnit: "Average °C",
+                  details: const [],
                 ),
                 _ExpandableMetricCard(
                   title: "Stress",
@@ -1508,29 +2363,32 @@ class _MetricsGrid extends StatelessWidget {
                   primaryValue: stressText,
                   primaryUnit: "level",
                   details: [
-                    ("Model", mlModelLoaded ? "trained logistic" : "fallback heuristic"),
-                    ("Probability", stressProb),
-                    ("Cortisol proxy", proxyText),
-                    ("Input", stressInputIssue ?? "all valid"),
-                    ("Calibration", calibrationReady ? "ready" : "$calibrationWindows/$calibrationTarget"),
-                    ("Window", "$windowSamples/$windowTarget"),
+                    ("Confidence", confidenceCombined),
                   ],
+                  footer: Align(
+                    alignment: Alignment.centerRight,
+                    child: OutlinedButton.icon(
+                      onPressed: onOpenStressDetails,
+                      icon: const Icon(Icons.open_in_new),
+                      label: const Text("Open details"),
+                    ),
+                  ),
                 ),
               ],
             ),
             const SizedBox(height: 14),
-            _MiniSparkline(title: "BPM trend", data: bpmHistory),
+            _MiniSparkline(title: "BPM trend", data: bpmHistory, onTap: onOpenBpmGraph),
             const SizedBox(height: 10),
-            _MiniSparkline(title: "GSR trend", data: gsrHistory),
+            _MiniSparkline(title: "GSR trend", data: gsrHistory, onTap: onOpenGsrGraph),
             const SizedBox(height: 10),
-            _MiniSparkline(title: "Stress probability trend", data: stressHistory),
+            _MiniSparkline(title: "Stress score trend", data: stressHistory, onTap: onOpenStressGraph),
           ],
         ),
       ),
     );
   }
 
-  String _fmt(double? v) => v == null ? "N/A" : v.toStringAsFixed(2);
+  String _fmt(double? v) => v == null ? "N/A" : v.toStringAsFixed(1);
 }
 
 class _ExpandableMetricCard extends StatelessWidget {
@@ -1540,6 +2398,7 @@ class _ExpandableMetricCard extends StatelessWidget {
   final String primaryValue;
   final String primaryUnit;
   final List<(String, String)> details;
+  final Widget? footer;
 
   const _ExpandableMetricCard({
     required this.title,
@@ -1548,6 +2407,7 @@ class _ExpandableMetricCard extends StatelessWidget {
     required this.primaryValue,
     required this.primaryUnit,
     required this.details,
+    this.footer,
   });
 
   @override
@@ -1588,9 +2448,13 @@ class _ExpandableMetricCard extends StatelessWidget {
               primaryValue,
               style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 18),
             ),
-            children: details
-                .map((d) => _DetailRow(label: d.$1, value: d.$2))
-                .toList(growable: false),
+            children: [
+              ...details.map((d) => _DetailRow(label: d.$1, value: d.$2)),
+              if (footer != null) ...[
+                const SizedBox(height: 6),
+                footer!,
+              ],
+            ],
           ),
         ),
       ),
@@ -1629,33 +2493,45 @@ class _DetailRow extends StatelessWidget {
 class _MiniSparkline extends StatelessWidget {
   final String title;
   final List<double> data;
+  final VoidCallback onTap;
 
-  const _MiniSparkline({required this.title, required this.data});
+  const _MiniSparkline({required this.title, required this.data, required this.onTap});
 
   @override
   Widget build(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
 
-    return Container(
-      padding: const EdgeInsets.all(12),
-      decoration: BoxDecoration(
-        borderRadius: BorderRadius.circular(14),
-        color: cs.surfaceContainerHighest.withValues(alpha: 0.22),
-        border: Border.all(color: Colors.white.withValues(alpha: 0.08)),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text(title, style: const TextStyle(fontWeight: FontWeight.w600)),
-          const SizedBox(height: 8),
-          SizedBox(
-            height: 42,
-            child: CustomPaint(
-              painter: _SparkPainter(data),
-              child: const SizedBox.expand(),
+    return InkWell(
+      borderRadius: BorderRadius.circular(14),
+      onTap: onTap,
+      child: Container(
+        padding: const EdgeInsets.all(12),
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(14),
+          color: cs.surfaceContainerHighest.withValues(alpha: 0.22),
+          border: Border.all(color: Colors.white.withValues(alpha: 0.08)),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Expanded(
+                  child: Text(title, style: const TextStyle(fontWeight: FontWeight.w600)),
+                ),
+                const Icon(Icons.open_in_full, size: 16),
+              ],
             ),
-          ),
-        ],
+            const SizedBox(height: 8),
+            SizedBox(
+              height: 42,
+              child: CustomPaint(
+                painter: _SparkPainter(data),
+                child: const SizedBox.expand(),
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -1696,6 +2572,263 @@ class _SparkPainter extends CustomPainter {
 
   @override
   bool shouldRepaint(covariant _SparkPainter oldDelegate) => oldDelegate.data != data;
+}
+
+class _GraphDetailPage extends StatelessWidget {
+  final String title;
+  final String unit;
+  final List<double> data;
+
+  const _GraphDetailPage({
+    required this.title,
+    required this.unit,
+    required this.data,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final minV = data.isEmpty ? null : data.reduce(min);
+    final maxV = data.isEmpty ? null : data.reduce(max);
+    final avgV = data.isEmpty ? null : data.reduce((a, b) => a + b) / data.length;
+    final width = max(480.0, data.length * 26.0);
+    return Scaffold(
+      appBar: AppBar(title: Text(title)),
+      body: ListView(
+        padding: const EdgeInsets.all(16),
+        children: [
+          _CardSection(
+            title: "Interactive graph",
+            subtitle: "Pinch to zoom and pan horizontally",
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: [
+                    _MiniPill(text: "Points ${data.length}"),
+                    _MiniPill(text: "Min ${minV?.toStringAsFixed(2) ?? "N/A"} $unit"),
+                    _MiniPill(text: "Max ${maxV?.toStringAsFixed(2) ?? "N/A"} $unit"),
+                    _MiniPill(text: "Avg ${avgV?.toStringAsFixed(2) ?? "N/A"} $unit"),
+                  ],
+                ),
+                const SizedBox(height: 12),
+                Container(
+                  height: 280,
+                  decoration: BoxDecoration(
+                    borderRadius: BorderRadius.circular(12),
+                    border: Border.all(color: Colors.white.withValues(alpha: 0.10)),
+                    color: Theme.of(context).colorScheme.surfaceContainerHighest.withValues(alpha: 0.24),
+                  ),
+                  child: data.length < 2
+                      ? const Center(child: Text("Not enough data yet"))
+                      : InteractiveViewer(
+                          minScale: 1.0,
+                          maxScale: 8.0,
+                          constrained: false,
+                          child: SizedBox(
+                            width: width,
+                            height: 260,
+                            child: CustomPaint(
+                              painter: _SparkPainter(data),
+                            ),
+                          ),
+                        ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _StressDetailsPage extends StatelessWidget {
+  final _MeasureSummary? measuredSummary;
+  final StressInferenceResult? stressResult;
+  final String? stressInputIssue;
+  final bool mlModelLoaded;
+  final bool calibrationReady;
+  final int calibrationSamples;
+  final int calibrationSampleMin;
+  final String calibrationElapsedText;
+  final String calibrationRemainingText;
+  final String inferenceWindowText;
+  final bool guidedCalibrationActive;
+
+  const _StressDetailsPage({
+    required this.measuredSummary,
+    required this.stressResult,
+    required this.stressInputIssue,
+    required this.mlModelLoaded,
+    required this.calibrationReady,
+    required this.calibrationSamples,
+    required this.calibrationSampleMin,
+    required this.calibrationElapsedText,
+    required this.calibrationRemainingText,
+    required this.inferenceWindowText,
+    required this.guidedCalibrationActive,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final activeScore = measuredSummary?.score ?? stressResult?.stressProbability;
+    final activeConfidence = measuredSummary?.confidence ?? stressResult?.confidence;
+    final activeLevel = measuredSummary?.level ?? stressResult?.levelText;
+    final confidence = activeConfidence == null ? "N/A" : "${(activeConfidence * 100).toStringAsFixed(0)}%";
+    final confidenceLevel = activeConfidence == null
+        ? "N/A"
+        : (activeConfidence >= 0.75
+            ? "High"
+            : (activeConfidence >= 0.45 ? "Medium" : "Low"));
+    final stressScore = activeScore == null ? "N/A" : activeScore.toStringAsFixed(3);
+    final cortisolProxy = activeScore == null ? "N/A" : (activeScore * 100).toStringAsFixed(1);
+    final stressLevel = activeLevel ?? "N/A";
+
+    return Scaffold(
+      appBar: AppBar(title: const Text("Stress Details")),
+      body: ListView(
+        padding: const EdgeInsets.all(16),
+        children: [
+          _CardSection(
+            title: "Current output",
+            subtitle: "Live inference fields",
+            child: Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                _MiniPill(text: "Stress level $stressLevel"),
+                _MiniPill(text: "Stress score $stressScore"),
+                _MiniPill(text: "Confidence $confidence"),
+                _MiniPill(text: "Confidence level $confidenceLevel"),
+                _MiniPill(text: "Cortisol proxy $cortisolProxy"),
+              ],
+            ),
+          ),
+          const SizedBox(height: 12),
+          _CardSection(
+            title: "How each value is computed",
+            subtitle: "Tap info for technical definition",
+            child: Column(
+              children: [
+                _ExplainTile(
+                  title: "Stress score",
+                  value: stressScore,
+                  explanation:
+                      "Stress score is the model output after calibration adjustment and smoothing. Smoothing uses exponential update: smooth_t = 0.7 * smooth_(t-1) + 0.3 * raw_t.",
+                ),
+                _ExplainTile(
+                  title: "Confidence",
+                  value: confidence,
+                  explanation:
+                      "Confidence blends baseline-relative sensor deviation confidence and model certainty. Sensor side uses HR, EDA, and Temp z-band levels weighted 0.4, 0.4, 0.2.",
+                ),
+                _ExplainTile(
+                  title: "Confidence level",
+                  value: confidenceLevel,
+                  explanation:
+                      "Confidence level is bucketed from confidence value: High >= 0.75, Medium >= 0.45, otherwise Low.",
+                ),
+                _ExplainTile(
+                  title: "Cortisol proxy",
+                  value: cortisolProxy,
+                  explanation:
+                      "Cortisol proxy is a non-medical trend value computed as stress_score * 100, clamped to [0,100]. It is not biochemical cortisol.",
+                ),
+                _ExplainTile(
+                  title: "Inference window",
+                  value: inferenceWindowText,
+                  explanation:
+                      "Inference window shows current buffered samples over required samples for feature extraction. It is not calibration progress.",
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 12),
+          _CardSection(
+            title: "Calibration state",
+            subtitle: "Personal baseline status",
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: [
+                    _MiniPill(text: calibrationReady ? "Calibrated" : "Uncalibrated"),
+                    _MiniPill(text: "Valid samples $calibrationSamples (min $calibrationSampleMin)"),
+                    _MiniPill(text: "Elapsed $calibrationElapsedText"),
+                    _MiniPill(text: "Time left $calibrationRemainingText"),
+                    _MiniPill(text: guidedCalibrationActive ? "Mode Calibrating" : "Mode Idle"),
+                  ],
+                ),
+                const SizedBox(height: 10),
+                Text(
+                  stressInputIssue == null ? "All required signals are valid." : stressInputIssue!,
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _ExplainTile extends StatelessWidget {
+  final String title;
+  final String value;
+  final String explanation;
+
+  const _ExplainTile({
+    required this.title,
+    required this.value,
+    required this.explanation,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return ListTile(
+      contentPadding: EdgeInsets.zero,
+      title: Text(title),
+      subtitle: Text(value),
+      trailing: IconButton(
+        icon: const Icon(Icons.info_outline),
+        onPressed: () {
+          showDialog<void>(
+            context: context,
+            builder: (ctx) => AlertDialog(
+              title: Text(title),
+              content: Text(explanation),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.of(ctx).pop(),
+                  child: const Text("Close"),
+                ),
+              ],
+            ),
+          );
+        },
+      ),
+    );
+  }
+}
+
+class _MeasureSummary {
+  final double score;
+  final double confidence;
+  final String level;
+  final int validSamples;
+  final int invalidSamples;
+
+  const _MeasureSummary({
+    required this.score,
+    required this.confidence,
+    required this.level,
+    required this.validSamples,
+    required this.invalidSamples,
+  });
 }
 
 class _CardSection extends StatelessWidget {
